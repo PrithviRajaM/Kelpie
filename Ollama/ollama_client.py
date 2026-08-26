@@ -295,8 +295,8 @@ def send_message_with_web(client: "ollama.Client", model: str, message: str, kee
             web_contents.append(f"--- Content from {url} ---\n{content}\n--- End of content ---")
 
     if not web_contents:
-        logger.log_warning(SCRIPT_NAME, "Could not fetch any web content. Falling back to standard message.")
-        return send_message(client, model, message, keep_alive)
+        logger.log_error(SCRIPT_NAME, "Could not fetch any web content. Aborting task to avoid generating assumed data.")
+        return None
 
     # Build an enriched prompt with the fetched web data
     combined_web_content = "\n\n".join(web_contents)
