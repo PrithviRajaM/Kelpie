@@ -1,0 +1,28 @@
+Task Scheduler create command:
+schtasks /Create /TN "Kelpie Scheduled Task" /TR "py -3 D:\AISpace\Kelpie\main.py" /SC MINUTE /MO 5 /RL HIGHEST /F
+
+
+Execution flow:
+
+Task Scheduler -> Kelpie Script
+
+Kelpie Script -> Run Tasks
+
+Task -> Prepare Prompt from Template
+
+Prompt -> Ollama model call
+
+Ollama model call response -> Record the Outcome
+
+Outcome -> Structured Response
+
+Structured Response -> Action or Report
+
+Action -|
+
+Report -> UI / Mobile App -|
+
+
+
+Task Manager:
+Parent Task -> Sub Tasks

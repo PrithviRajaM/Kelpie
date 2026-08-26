@@ -1,0 +1,18 @@
+{
+    "ollama_host": "http://localhost:11434",
+    "keep_alive": "5m",
+    "models": [
+        "qwen3.8:27b",
+        "deepseek-ocr:3b",
+        "deepseek-ocr:latest",
+        "llama3.1:70b",
+        "qwen3.5:9b",
+        "qwen3.5:4b"
+    ],
+    "default_model": "qwen3.5:9b",
+    "web_access": {
+        "enabled": true,
+        "model": "qwen3.5:9b",
+        "timeout_seconds": 120
+    }
+}
