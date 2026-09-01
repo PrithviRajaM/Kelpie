@@ -263,10 +263,16 @@ def fetch_web_content(url: str, model: str, config: dict) -> str | None:
 def send_message_with_web(client: "ollama.Client", model: str, message: str, keep_alive: str, config: dict):
     """Send a chat message with web access support.
 
-    If the message contains URLs, this function first fetches the web content
-    from those URLs using the Ollama /api/generate endpoint (Page Assist backend),
-    then incorporates the fetched content into the prompt before sending it to
-    the model for a final response.
+    Uses the llm-axe powered webSearch module (when use_llm_axe is enabled)
+    to perform real web searches, fetch website content as markdown, and
+    apply RAG for grounded responses. Falls back to the legacy Page Assist
+    approach when use_llm_axe is disabled.
+
+    Strategy:
+    - If the message contains URLs → fetch those pages via llm-axe, convert
+      to markdown, and pass as context to the model.
+    - If no URLs but web access is needed → perform a web search via llm-axe
+      OnlineAgent, get structured results, and pass as context.
 
     Args:
         client: The Ollama client instance.
@@ -278,36 +284,67 @@ def send_message_with_web(client: "ollama.Client", model: str, message: str, kee
     Returns:
         The model's response string, or None on failure.
     """
-    web_access_enabled = config.get("web_access", {}).get("enabled", False)
-    urls = extract_urls(message)
+    web_config = config.get("web_access", {})
+    web_access_enabled = web_config.get("enabled", False)
+    use_llm_axe = web_config.get("use_llm_axe", True)
 
-    if not web_access_enabled or not urls:
-        # Fall back to standard send_message if web access is disabled or no URLs found
+    if not web_access_enabled:
+        # Web access disabled - use standard message sending
         return send_message(client, model, message, keep_alive)
 
-    logger.log_info(SCRIPT_NAME, f"Web access enabled. Found {len(urls)} URL(s) in prompt: {urls}")
+    # --- llm-axe powered path (new) ---
+    if use_llm_axe:
+        return _send_message_with_llm_axe(client, model, message, keep_alive, config)
 
-    # Fetch content from each URL
-    web_contents = []
-    for url in urls:
-        content = fetch_web_content(url, model, config)
-        if content:
-            web_contents.append(f"--- Content from {url} ---\n{content}\n--- End of content ---")
+    # --- Legacy Page Assist path (fallback) ---
+    return _send_message_with_page_assist(client, model, message, keep_alive, config)
 
-    if not web_contents:
-        logger.log_error(SCRIPT_NAME, "Could not fetch any web content. Aborting task to avoid generating assumed data.")
-        return None
 
-    # Build an enriched prompt with the fetched web data
-    combined_web_content = "\n\n".join(web_contents)
-    enriched_message = (
-        f"{message}\n\n"
-        f"Below is the actual content retrieved from the website(s). "
-        f"Use this data to answer the request accurately:\n\n"
-        f"{combined_web_content}"
+def _send_message_with_llm_axe(client: "ollama.Client", model: str, message: str, keep_alive: str, config: dict):
+    """Web-enriched message sending via llm-axe (OnlineAgent, WebsiteReader, RAG).
+
+    Fetches web content using the webSearch module, converts to markdown,
+    and passes structured context alongside the original prompt to the model.
+    """
+    # Import the webSearch module (add project root to path if needed)
+    project_root = os.path.dirname(SCRIPT_DIR)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    try:
+        from webSearch.web_search_agent import get_web_enriched_context
+    except ImportError as e:
+        logger.log_error(SCRIPT_NAME, f"Failed to import webSearch module: {e}. Falling back to standard send.")
+        return send_message(client, model, message, keep_alive)
+
+    ollama_host = config.get("ollama_host", "http://localhost:11434")
+    web_config = config.get("web_access", {})
+    web_model = web_config.get("model", model)
+    embedding_model = web_config.get("embedding_model", "nomic-embed-text")
+
+    logger.log_info(SCRIPT_NAME, f"Using llm-axe web search (model='{web_model}') for message: {message[:100]}...")
+
+    # Get web-enriched context (markdown content from URLs or search results)
+    web_context = get_web_enriched_context(
+        message=message,
+        ollama_host=ollama_host,
+        model=web_model,
+        embedding_model=embedding_model,
     )
 
-    logger.log_info(SCRIPT_NAME, f"Sending web-enriched message to '{model}' ({len(enriched_message)} chars).")
+    if not web_context:
+        logger.log_warning(SCRIPT_NAME, "llm-axe web search returned no content. Aborting to avoid hallucination.")
+        return None
+
+    # Build the enriched prompt with structured web content
+    enriched_message = (
+        f"{message}\n\n"
+        f"Below is structured web content retrieved from the internet. "
+        f"Use ONLY this data to answer the request accurately:\n\n"
+        f"{web_context}"
+    )
+
+    logger.log_info(SCRIPT_NAME, f"Sending llm-axe web-enriched message to '{model}' ({len(enriched_message)} chars).")
 
     try:
         response = client.chat(
@@ -321,7 +358,57 @@ def send_message_with_web(client: "ollama.Client", model: str, message: str, kee
         return None
 
     reply = response.message.content
-    logger.log_info(SCRIPT_NAME, f"Received web-enriched response from '{model}': {reply}")
+    logger.log_info(SCRIPT_NAME, f"Received llm-axe web-enriched response from '{model}': {reply}")
+    return reply
+
+
+def _send_message_with_page_assist(client: "ollama.Client", model: str, message: str, keep_alive: str, config: dict):
+    """Legacy web-enriched message sending via Page Assist /api/generate.
+
+    Used as fallback when use_llm_axe is set to false in config.
+    """
+    urls = extract_urls(message)
+
+    if not urls:
+        return send_message(client, model, message, keep_alive)
+
+    logger.log_info(SCRIPT_NAME, f"[Legacy] Web access enabled. Found {len(urls)} URL(s) in prompt: {urls}")
+
+    # Fetch content from each URL using the old Page Assist method
+    web_contents = []
+    for url in urls:
+        content = fetch_web_content(url, model, config)
+        if content:
+            web_contents.append(f"--- Content from {url} ---\n{content}\n--- End of content ---")
+
+    if not web_contents:
+        logger.log_error(SCRIPT_NAME, "[Legacy] Could not fetch any web content. Aborting task to avoid generating assumed data.")
+        return None
+
+    # Build an enriched prompt with the fetched web data
+    combined_web_content = "\n\n".join(web_contents)
+    enriched_message = (
+        f"{message}\n\n"
+        f"Below is the actual content retrieved from the website(s). "
+        f"Use this data to answer the request accurately:\n\n"
+        f"{combined_web_content}"
+    )
+
+    logger.log_info(SCRIPT_NAME, f"[Legacy] Sending web-enriched message to '{model}' ({len(enriched_message)} chars).")
+
+    try:
+        response = client.chat(
+            model=model,
+            messages=[{"role": "user", "content": enriched_message}],
+            keep_alive=keep_alive,
+        )
+    except Exception as e:
+        logger.log_error(SCRIPT_NAME, f"Chat request to '{model}' failed: {e}")
+        print(f"Error: {e}")
+        return None
+
+    reply = response.message.content
+    logger.log_info(SCRIPT_NAME, f"[Legacy] Received web-enriched response from '{model}': {reply}")
     return reply
 
 

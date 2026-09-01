@@ -13,6 +13,10 @@
     "web_access": {
         "enabled": true,
         "model": "qwen3.5:9b",
-        "timeout_seconds": 120
+        "timeout_seconds": 120,
+        "use_llm_axe": true,
+        "embedding_model": "nomic-embed-text",
+        "rag_top_k": 5,
+        "rag_sentences_per_chunk": 3
     }
 }
