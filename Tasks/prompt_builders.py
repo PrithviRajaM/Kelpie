@@ -77,24 +77,3 @@ def build_prompt(task_name: str, template_content: str) -> str:
 
     logger.log_info(SCRIPT_NAME, f"Using default prompt builder for task '{task_name}'.")
     return default_builder(template_content)
-
-
-# ---------------------------------------------------------------------------
-# Custom builders for specific tasks go below.
-# Each one is auto-registered via the @register_builder decorator.
-# ---------------------------------------------------------------------------
-
-@register_builder("List_Coffee_Coles")
-def build_list_coffee_coles(template_content: str) -> str:
-    """Custom builder for the Coles coffee listing task.
-
-    Adds specificity around output format and constraints.
-    """
-    prompt = (
-        "You are a product research assistant.\n\n"
-        f"Instruction: {template_content}\n\n"
-        "Return the results as a numbered list with product name and price if available.\n"
-        "If you cannot access live data, provide your best knowledge of popular coffee "
-        "products typically available at Coles Australia."
-    )
-    return prompt
