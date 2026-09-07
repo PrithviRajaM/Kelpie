@@ -130,8 +130,6 @@ def main():
 
     logger.log_info(SCRIPT_NAME, "Scheduled execution completed.")
     logger.log_info(SCRIPT_NAME, "----------------------------------------------------------------------------------------------------")
-    logger.log_info(SCRIPT_NAME, "")
-    logger.log_info(SCRIPT_NAME, "")
 
 if __name__ == "__main__":
     main()
