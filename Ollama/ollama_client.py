@@ -260,7 +260,7 @@ def fetch_web_content(url: str, model: str, config: dict) -> str | None:
         return None
 
 
-def send_message_with_web(client: "ollama.Client", model: str, message: str, keep_alive: str, config: dict):
+def send_message_with_web(client: "ollama.Client", model: str, message: str, keep_alive: str, config: dict, web_access_enabled: bool = True):
     """Send a chat message with web access support.
 
     Uses the llm-axe powered webSearch module (when use_llm_axe is enabled)
@@ -280,16 +280,18 @@ def send_message_with_web(client: "ollama.Client", model: str, message: str, kee
         message: The user prompt (may contain URLs).
         keep_alive: Keep-alive duration string.
         config: The Ollama configuration dict.
+        web_access_enabled: Whether this call should fetch web content. This is
+            decided by the caller (e.g. the task's web_access_mode), not by the
+            task-level "enabled" flag in task_config.json.
 
     Returns:
         The model's response string, or None on failure.
     """
     web_config = config.get("web_access", {})
-    web_access_enabled = web_config.get("enabled", False)
     use_llm_axe = web_config.get("use_llm_axe", True)
 
     if not web_access_enabled:
-        # Web access disabled - use standard message sending
+        # Web access not requested for this call - use standard message sending
         return send_message(client, model, message, keep_alive)
 
     # --- llm-axe powered path (new) ---

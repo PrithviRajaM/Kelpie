@@ -18,5 +18,11 @@
         "embedding_model": "nomic-embed-text",
         "rag_top_k": 5,
         "rag_sentences_per_chunk": 3
+    },
+    "web_through_mcp": {
+        "mcphost_command": "mcphost",
+        "model": "ollama:qwen3.5:9b",
+        "mcp_config_path": "D:\\AISpace\\mcp-servers.config.json",
+        "timeout_seconds": 600
     }
 }
