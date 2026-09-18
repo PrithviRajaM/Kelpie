@@ -23,13 +23,7 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "Ollama"))
 
 import kelpie_logger as logger
 from Tasks.prompt_builders import build_prompt
-from ollama_client import load_config as load_ollama_config, get_client, resolve_model, send_message, send_message_with_web
-from mcp_client import send_message_through_mcp
-
-# Supported web access interaction modes (task_config.json "web_access_mode").
-WEB_MODE_FIRST = "web_first"
-WEB_MODE_THROUGH_MCP = "web_through_mcp"
-DEFAULT_WEB_MODE = WEB_MODE_FIRST
+from ollama_client import load_config as load_ollama_config, get_client, resolve_model, send_message
 
 SCRIPT_NAME = "task_runner.py"
 TASK_CONFIG_PATH = os.path.join(TASKS_DIR, "task_config.json")
@@ -134,51 +128,18 @@ def load_template(task_name: str) -> str | None:
         return None
 
 
-def execute_task(task_name: str, template_content: str, web_access_mode: str = DEFAULT_WEB_MODE) -> str | None:
-    """Execute a task: build prompt, call Ollama, return the response.
-
-    The web_access_mode selects how the model interacts with the web:
-      - "web_first" (default): Kelpie fetches web content, converts it to
-        markdown, and feeds a single grounded prompt to the model
-        (send_message_with_web).
-      - "web_through_mcp": Kelpie hands the model an agentic loop via mcphost,
-        letting the model decide how many times to interact with web content
-        through MCP servers (send_message_through_mcp).
-    """
+def execute_task(task_name: str, template_content: str) -> str | None:
+    """Execute a task: build prompt, call Ollama, return the response."""
     # Build prompt using the extensible prompt builder
     prompt = build_prompt(task_name, template_content)
     logger.log_info(SCRIPT_NAME, f"Prompt built for task '{task_name}': {prompt[:100]}...")
 
-    # Load Ollama config (shared by both web access modes)
+    # Load Ollama config
     try:
         ollama_config = load_ollama_config()
     except Exception as e:
         logger.log_error(SCRIPT_NAME, f"Failed to load Ollama config for task '{task_name}': {e}")
         return None
-
-    mode = (web_access_mode or DEFAULT_WEB_MODE).strip().lower()
-
-    # --- web_through_mcp: agentic, model-driven web interaction via mcphost ---
-    if mode == WEB_MODE_THROUGH_MCP:
-        logger.log_info(
-            SCRIPT_NAME,
-            f"Task '{task_name}' using web_access_mode='{WEB_MODE_THROUGH_MCP}' (mcphost agentic loop).",
-        )
-        response = send_message_through_mcp(prompt, ollama_config)
-
-        if response:
-            logger.log_info(SCRIPT_NAME, f"Task '{task_name}' completed. Response length: {len(response)} chars.")
-            logger.log_info(SCRIPT_NAME, f"Task '{task_name}' response: {response[:500]}")
-        else:
-            logger.log_error(SCRIPT_NAME, f"Task '{task_name}' received no response from mcphost.")
-        return response
-
-    # --- web_first (default): Kelpie-fetched web content fed to the model ---
-    if mode != WEB_MODE_FIRST:
-        logger.log_warning(
-            SCRIPT_NAME,
-            f"Task '{task_name}' has unknown web_access_mode='{web_access_mode}'. Falling back to '{WEB_MODE_FIRST}'.",
-        )
 
     try:
         client = get_client(ollama_config)
@@ -188,11 +149,8 @@ def execute_task(task_name: str, template_content: str, web_access_mode: str = D
         logger.log_error(SCRIPT_NAME, f"Failed to initialize Ollama client for task '{task_name}': {e}")
         return None
 
-    logger.log_info(SCRIPT_NAME, f"Task '{task_name}' using web_access_mode='{WEB_MODE_FIRST}'. Calling Ollama model '{model}'...")
-    # web_first mode always requests web content; whether web fetching happens is
-    # driven by the task's web_access_mode, not by task_config.json's "enabled"
-    # flag (which only controls whether the task runs at all).
-    response = send_message_with_web(client, model, prompt, keep_alive, ollama_config, web_access_enabled=True)
+    logger.log_info(SCRIPT_NAME, f"Task '{task_name}' calling Ollama model '{model}'...")
+    response = send_message(client, model, prompt, keep_alive)
 
     if response:
         logger.log_info(SCRIPT_NAME, f"Task '{task_name}' completed. Response length: {len(response)} chars.")
@@ -249,11 +207,8 @@ def run_all_tasks() -> None:
         if not template_content:
             continue
 
-        # Determine web access interaction mode (defaults to web_first)
-        web_access_mode = task.get("web_access_mode") or DEFAULT_WEB_MODE
-
         # Execute the task
-        response = execute_task(task_name, template_content, web_access_mode)
+        response = execute_task(task_name, template_content)
 
         # Save execution timestamp regardless of success (to avoid retry storms)
         if "tasks" not in state:

@@ -2,7 +2,6 @@
     {
         "name": "List_Coffee_Coles",
         "frequency_in_minutes": 1,
-        "enabled": true,
-        "web_access_mode": "web_through_mcp"
+        "enabled": true
     }
 ]

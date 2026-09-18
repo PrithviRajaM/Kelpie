@@ -9,20 +9,5 @@
         "qwen3.5:9b",
         "qwen3.5:4b"
     ],
-    "default_model": "qwen3.5:9b",
-    "web_access": {
-        "enabled": true,
-        "model": "qwen3.5:9b",
-        "timeout_seconds": 120,
-        "use_llm_axe": true,
-        "embedding_model": "nomic-embed-text",
-        "rag_top_k": 5,
-        "rag_sentences_per_chunk": 3
-    },
-    "web_through_mcp": {
-        "mcphost_command": "mcphost",
-        "model": "ollama:qwen3.5:9b",
-        "mcp_config_path": "D:\\AISpace\\mcp-servers.config.json",
-        "timeout_seconds": 600
-    }
+    "default_model": "qwen3.5:9b"
 }
