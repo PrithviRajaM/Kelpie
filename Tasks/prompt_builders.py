@@ -1,16 +1,8 @@
 """
-Prompt Builders - Extensible prompt construction for Kelpie tasks.
+Prompt Builders - Prompt construction for Kelpie tasks.
 
-Uses a registry pattern so new task-specific prompt builders can be added
-without modifying the core logic. Each builder is a function that receives
-the raw template content and returns a ready-to-send AI prompt string.
-
-To add a custom builder for a new task:
-    1. Define a function: def build_<task_name>(template_content: str) -> str
-    2. Register it: @register_builder("<task_name>")
-
-If no custom builder is registered for a task, the default builder is used
-which wraps the template content with a simple instruction preamble.
+The prompt sent to the model is the task's template content exactly as
+authored. No preamble, instructions, or wrapping text are added.
 """
 
 import os
@@ -24,56 +16,20 @@ import kelpie_logger as logger
 
 SCRIPT_NAME = "prompt_builders.py"
 
-# Registry: maps task_name -> builder function
-_BUILDERS: dict[str, callable] = {}
-
-
-def register_builder(task_name: str):
-    """Decorator to register a custom prompt builder for a specific task.
-
-    Usage:
-        @register_builder("My_Custom_Task")
-        def build_my_custom_task(template_content: str) -> str:
-            return f"Custom preamble: {template_content}"
-    """
-    def decorator(func):
-        _BUILDERS[task_name] = func
-        logger.log_debug(SCRIPT_NAME, f"Registered custom prompt builder for task '{task_name}'.")
-        return func
-    return decorator
-
-
-def default_builder(template_content: str) -> str:
-    """Default prompt builder - wraps template content with a clear instruction.
-
-    Used when no task-specific builder is registered.
-    """
-    prompt = (
-        "You are a helpful AI assistant. Complete the following task accurately.\n\n"
-        f"Task:\n{template_content}\n\n"
-        "Provide a clear, structured response."
-    )
-    return prompt
-
 
 def build_prompt(task_name: str, template_content: str) -> str:
-    """Build the final prompt for a task.
+    """Return the task's template content unchanged as the prompt.
 
-    Looks up a registered custom builder for the task_name. Falls back to
-    the default builder if none is registered.
+    The template content is passed to the model verbatim; nothing is added
+    or altered.
 
     Args:
         task_name: The name of the task (matches task_config.json 'name' field).
         template_content: Raw content loaded from the template file.
 
     Returns:
-        The constructed prompt string ready to send to the AI model.
+        The template content, unmodified.
     """
-    builder = _BUILDERS.get(task_name, None)
+    logger.log_info(SCRIPT_NAME, f"Building prompt for task '{task_name}'.")
 
-    if builder:
-        logger.log_info(SCRIPT_NAME, f"Using custom prompt builder for task '{task_name}'.")
-        return builder(template_content)
-
-    logger.log_info(SCRIPT_NAME, f"Using default prompt builder for task '{task_name}'.")
-    return default_builder(template_content)
+    return template_content

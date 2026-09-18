@@ -85,13 +85,6 @@ def resolve_model(requested_model, config: dict) -> str:
             "No model specified and no 'default_model' configured in ollama_config.json."
         )
 
-    configured_models = config.get("models", [])
-    if configured_models and default_model not in configured_models:
-        logger.log_warning(
-            SCRIPT_NAME,
-            f"default_model '{default_model}' is not listed in the configured 'models' array.",
-        )
-
     return default_model
 
 
