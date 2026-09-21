@@ -6,11 +6,11 @@ global config (``kelpie_config.json``); default ``D:\Logs\KelpieLogs``, one
 file per day. Each log line format:
 ``HH:MM:SS [session_counter] <source_script> <message>``.
 
-The session counter is a per-session value that stays constant for the
-lifetime of a single scheduled execution (session). It is incremented once
-when the session starts (see ``start_session``) and persisted to
-``log_state.json`` (runtime state, co-located with this module) so the next
-session continues from the last value.
+The session counter is set externally by the caller via
+``set_session_counter``. The logger itself no longer owns, derives, or
+persists the counter; it simply stamps whatever value has been set into each
+log line. The counter is now derived and persisted per profile by the task
+runner in ``<profile_dir>/Task_Config.json`` (per qualified task run).
 
 Whether the source script name is included in a log line is controlled by the
 ``save_script_name`` setting in the global config (``kelpie_config.json``).
@@ -32,75 +32,42 @@ import config as kelpie_config
 # Global log directory now comes from the centralized config.
 LOG_DIR = kelpie_config.get_log_dir()
 
-# Runtime state file (holds the incrementing session counter). This is mutable
-# per-run state, kept separate from the human-edited global config so that
-# config file is never rewritten on every session.
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log_state.json")
-
-# Session counter for the current process. Loaded/incremented by
-# ``start_session`` and held constant for all logging within the session.
+# Session counter stamped into each log line. This value is set externally by
+# the caller (the task runner) via ``set_session_counter``; the logger no
+# longer derives or persists it.
 _session_counter = 0
 
 # Cached value of the save_script_name property (from the global config).
 _save_script_name = True
 
 
-def _read_state() -> dict:
-    """Read the runtime state file (session counter) into a dict."""
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            return data
-    except (OSError, json.JSONDecodeError):
-        pass
-    return {}
-
-
-def _write_state(state: dict):
-    """Persist the runtime state file."""
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=4)
-    except OSError:
-        pass
-
-
 def _load_config():
-    """Load the counter (from state) and save_script_name (from global config)."""
+    """Load save_script_name (from global config)."""
+    global _save_script_name
+    _save_script_name = kelpie_config.get_save_script_name()
+
+
+def set_session_counter(counter: int) -> None:
+    """Set the session counter stamped into subsequent log lines.
+
+    The counter is derived and persisted by the task runner (in
+    ``Tasks/task_execution_state.json``). Calling this makes all following log
+    lines carry ``counter`` until it is set again. Also refreshes the cached
+    ``save_script_name`` setting from the global config.
+
+    Args:
+        counter: The session counter value to stamp into log lines.
+    """
     global _session_counter, _save_script_name
-    state = _read_state()
     try:
-        _session_counter = int(state.get("session_counter", 0))
+        _session_counter = int(counter)
     except (ValueError, TypeError):
         _session_counter = 0
     _save_script_name = kelpie_config.get_save_script_name()
 
 
-def start_session() -> int:
-    """Begin a new logging session.
-
-    Increments the persisted session counter by one and holds the new value
-    for the lifetime of this process. All subsequent log lines use this same
-    counter value. Call this once at the start of each scheduled execution.
-
-    Returns:
-        The counter value for the newly started session.
-    """
-    global _session_counter, _save_script_name
-    state = _read_state()
-
-    try:
-        current = int(state.get("session_counter", 0))
-    except (ValueError, TypeError):
-        current = 0
-
-    _session_counter = current + 1
-    _save_script_name = kelpie_config.get_save_script_name()
-
-    state["session_counter"] = _session_counter
-    _write_state(state)
-
+def get_session_counter() -> int:
+    """Return the session counter currently being stamped into log lines."""
     return _session_counter
 
 
@@ -262,5 +229,6 @@ def log_task_error(logs_dir: str, source: str, message: str):
 
 
 # Load current config values on import so that any logging performed before
-# an explicit ``start_session`` call still reflects the persisted settings.
+# an explicit ``set_session_counter`` call still reflects the persisted
+# settings (with the session counter defaulting to 0 until set).
 _load_config()

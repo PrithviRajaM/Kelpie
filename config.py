@@ -24,8 +24,8 @@ Note on mutable state
 ---------------------
 This file holds only *static, human-edited* settings. The incrementing logging
 ``session_counter`` is runtime state, not configuration, and is persisted
-separately by the logger (``Logger/log_state.json``) so this shared config is
-never rewritten on every run.
+per profile by the task runner in ``<profile_dir>/Task_Config.json`` so this
+shared config is never rewritten on every run.
 """
 
 import json

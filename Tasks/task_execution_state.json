@@ -3,6 +3,24 @@
         "List_Coffee_Coles": {
             "last_execution": "2026-09-07T21:24:23.834384",
             "last_status": "success"
+        },
+        "pm@teamglobalexp.com/Task3": {
+            "email": "pm@teamglobalexp.com",
+            "name": "Task3",
+            "last_execution": "2026-09-21T16:28:22.347187",
+            "last_status": "success"
+        },
+        "radha@teamglobalexp.com/Task 2": {
+            "email": "radha@teamglobalexp.com",
+            "name": "Task 2",
+            "last_execution": "2026-09-21T16:28:38.952924",
+            "last_status": "success"
+        },
+        "radha@teamglobalexp.com/Task to test functionality": {
+            "email": "radha@teamglobalexp.com",
+            "name": "Task to test functionality",
+            "last_execution": "2026-09-21T16:28:47.883963",
+            "last_status": "success"
         }
     }
 }

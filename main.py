@@ -106,10 +106,9 @@ def release_lock():
 
 
 def main():
-    # Begin a new logging session: increments and persists the session
-    # counter, which stays constant for all logging in this execution.
-    logger.start_session()
-
+    # The session counter is no longer a per-process value. It is derived and
+    # persisted per qualified task run by the task runner (which stamps it on
+    # the logger). Any logging before the first task run uses counter 0.
     if not acquire_lock():
         logger.log_info(
             SCRIPT_NAME,

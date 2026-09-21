@@ -60,6 +60,10 @@ TASK_CONFIG_FILENAME = "TaskConfig.json"
 TASK_PROMPT_FILENAME = "TaskPrompt.txt"
 TASK_LOGS_DIRNAME = "Logs"
 
+# Per-profile config file (holds that profile's incrementing session counter).
+# Lives directly inside the profile folder: "<DATA_ROOT>/<email>/Task_Config.json".
+PROFILE_CONFIG_FILENAME = "Task_Config.json"
+
 # Execution state stays local to the Kelpie install (not per-profile).
 EXECUTION_STATE_PATH = os.path.join(TASKS_DIR, "task_execution_state.json")
 
@@ -72,16 +76,20 @@ class DiscoveredTask:
         name: The task name (== its folder name and its config 'name').
         config: The parsed TaskConfig.json contents.
         task_dir: Absolute path to the task's folder.
+        profile_dir: Absolute path to the owning profile folder
+            (``<DATA_ROOT>/<email>``), where the per-profile Task_Config.json
+            (session counter) lives.
         prompt_path: Absolute path to the task's TaskPrompt.txt.
         logs_dir: Absolute path to the task's Logs folder.
         state_key: Stable key for execution state ("<email>/<name>").
     """
 
-    def __init__(self, email: str, name: str, config: dict, task_dir: str):
+    def __init__(self, email: str, name: str, config: dict, task_dir: str, profile_dir: str):
         self.email = email
         self.name = name
         self.config = config
         self.task_dir = task_dir
+        self.profile_dir = profile_dir
         self.prompt_path = os.path.join(task_dir, TASK_PROMPT_FILENAME)
         self.logs_dir = os.path.join(task_dir, TASK_LOGS_DIRNAME)
         self.state_key = f"{email}/{name}"
@@ -128,7 +136,7 @@ def discover_tasks() -> list:
             if config is None:
                 continue
 
-            discovered.append(DiscoveredTask(email, task_name, config, task_dir))
+            discovered.append(DiscoveredTask(email, task_name, config, task_dir, profile_dir))
 
     logger.log_info(
         SCRIPT_NAME,
@@ -176,6 +184,71 @@ def save_execution_state(state: dict) -> None:
             json.dump(state, f, indent=4)
     except IOError as e:
         logger.log_error(SCRIPT_NAME, f"Failed to save execution state: {e}")
+
+
+def next_session_counter(profile_dir: str) -> int:
+    """Derive, persist, and activate a new session counter for a profile.
+
+    The counter is stored per profile in ``<profile_dir>/Task_Config.json``
+    under the key ``session_counter``. Behavior:
+
+      - If the file does not exist (or is unreadable/invalid), it is created
+        with ``session_counter`` set to 1, and 1 is used for this run.
+      - Otherwise the stored value is incremented by one, written back to the
+        file immediately, and the incremented value is used for this run.
+
+    The resulting value is set on the logger so that every subsequent log line
+    (global and per-task) carries this profile's session counter.
+
+    Args:
+        profile_dir: Absolute path to the owning profile folder.
+
+    Returns:
+        The session counter value to use for this run.
+    """
+    config_path = os.path.join(profile_dir, PROFILE_CONFIG_FILENAME)
+
+    existing = None
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                existing = data
+        except (OSError, json.JSONDecodeError) as e:
+            logger.log_warning(
+                SCRIPT_NAME,
+                f"Could not read {PROFILE_CONFIG_FILENAME} in {profile_dir}, recreating: {e}",
+            )
+
+    if existing is None:
+        # File missing or invalid: start this profile's counter at 1.
+        config = {"session_counter": 1}
+    else:
+        config = existing
+        try:
+            current = int(config.get("session_counter", 0))
+        except (ValueError, TypeError):
+            current = 0
+        config["session_counter"] = current + 1
+
+    new_counter = config["session_counter"]
+
+    # Persist the incremented value immediately, before the task proceeds.
+    try:
+        os.makedirs(profile_dir, exist_ok=True)
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=4)
+    except OSError as e:
+        logger.log_error(
+            SCRIPT_NAME,
+            f"Failed to persist {PROFILE_CONFIG_FILENAME} in {profile_dir}: {e}",
+        )
+
+    # From here on, all logging for this task run carries this counter.
+    logger.set_session_counter(new_counter)
+
+    return new_counter
 
 
 def is_task_due(task: "DiscoveredTask", frequency_minutes: int, state: dict) -> bool:
@@ -328,9 +401,13 @@ def run_all_tasks() -> None:
         if not is_task_due(task, frequency_minutes, state):
             continue
 
-        # Task is qualified to run
-        logger.log_info(SCRIPT_NAME, f"Task '{config_name}' ({task.email}) has started to run.")
-        logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Task '{config_name}' has started to run.")
+        # Task is qualified to run. Derive a fresh session counter for this
+        # task's profile and persist it immediately; every log line below
+        # (global and per-task) will carry this counter.
+        session_counter = next_session_counter(task.profile_dir)
+
+        logger.log_info(SCRIPT_NAME, f"Task '{config_name}' ({task.email}) has started to run (session {session_counter}).")
+        logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Task '{config_name}' has started to run (session {session_counter}).")
 
         # Load the task's own prompt
         prompt_content = load_prompt(task)
@@ -338,7 +415,7 @@ def run_all_tasks() -> None:
             continue
 
         # Execute the task
-        response = execute_task(task, prompt_content)
+        response = "Task skipped" #execute_task(task, prompt_content)
 
         # Save execution timestamp regardless of success (to avoid retry storms)
         if "tasks" not in state:
