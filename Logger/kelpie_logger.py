@@ -66,11 +66,6 @@ def set_session_counter(counter: int) -> None:
     _save_script_name = kelpie_config.get_save_script_name()
 
 
-def get_session_counter() -> int:
-    """Return the session counter currently being stamped into log lines."""
-    return _session_counter
-
-
 def _ensure_log_dir():
     """Create the log directory if it does not exist."""
     os.makedirs(LOG_DIR, exist_ok=True)
