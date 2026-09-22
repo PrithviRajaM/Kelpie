@@ -1,35 +1,16 @@
-"""FastAPI application entry point (unified under Kelpie).
+"""FastAPI application entry point.
 
 Exposes endpoints for a web UI to interact with. CORS is enabled so a
 browser-based UI (served from a different origin) can call the API.
-
-Logging goes through the shared Kelpie logger so NumbatAPI activity is
-recorded in the same global Kelpie log as the rest of the project.
 """
 from __future__ import annotations
-
-import os
-import sys
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# Make the Kelpie project root and its Logger importable regardless of the
-# working directory uvicorn is launched from. main.py -> app -> NumbatAPI ->
-# Kelpie (root).
-_PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-_LOGGER_DIR = os.path.join(_PROJECT_ROOT, "Logger")
-if _LOGGER_DIR not in sys.path:
-    sys.path.insert(0, _LOGGER_DIR)
-
-import kelpie_logger as logger  # noqa: E402  (path set up above)
-
-from .config import settings  # noqa: E402
-from .models import (  # noqa: E402
+from .config import settings
+from .models import (
+    DeleteTaskResponse,
     LogLinesResponse,
     LogRunListResponse,
     ProfileRequest,
@@ -41,12 +22,13 @@ from .models import (  # noqa: E402
     TaskDetailResponse,
     TaskListResponse,
 )
-from .services import (  # noqa: E402
+from .services import (
     DomainNotAllowedError,
     LogRunNotFoundError,
     ProfileNotFoundError,
     TaskExistsError,
     TaskNotFoundError,
+    delete_task,
     get_log_run_lines,
     get_task,
     list_log_runs,
@@ -56,11 +38,9 @@ from .services import (  # noqa: E402
     save_task,
 )
 
-SCRIPT_NAME = "main.py"
-
 app = FastAPI(
     title="Numbat API",
-    description="Backend API for the Numbat web UI (unified under Kelpie).",
+    description="Backend API for the Numbat web UI.",
     version="0.1.0",
 )
 
@@ -73,16 +53,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def _on_startup() -> None:
-    """Log service startup and the resolved data root for traceability."""
-    logger.log_info(
-        SCRIPT_NAME,
-        f"Numbat API starting; data_root={settings.data_root} "
-        f"allowed_domain={settings.allowed_domain}",
-    )
 
 
 @app.get("/health")
@@ -175,11 +145,33 @@ def create_or_update_task(payload: SaveTaskRequest) -> SaveTaskResponse:
     return SaveTaskResponse(message=message, name=name, created=created)
 
 
+@app.delete("/tasks/{task_name}", response_model=DeleteTaskResponse)
+def delete_task_by_name(task_name: str, email: str) -> DeleteTaskResponse:
+    """Soft-delete a task by suffixing its folder name with ``_DELETED``.
+
+    The folder is renamed rather than removed, so it is hidden from listings and
+    its original name can be reused. If a matching ``_DELETED`` folder already
+    exists, it is hard-deleted first.
+
+    - `email`: the owning user (query parameter).
+    - 400 if the email domain is not allowed.
+    - 404 if the profile or task does not exist.
+    """
+    try:
+        name = delete_task(email, task_name)
+    except DomainNotAllowedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ProfileNotFoundError, TaskNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return DeleteTaskResponse(message=f"Task '{name}' deleted", name=name)
+
+
 @app.post("/tasks/{task_name}/run", response_model=RunTaskResponse)
 def run_task_now(task_name: str, payload: RunTaskRequest) -> RunTaskResponse:
     """Trigger an immediate run of a task.
 
-    For now the backend simply logs the received request; actual execution
+    For now the backend simply prints the received request; actual execution
     will be added later.
 
     - 400 if the email domain is not allowed.

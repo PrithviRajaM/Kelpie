@@ -21,6 +21,12 @@
             "name": "Task to test functionality",
             "last_execution": "2026-09-21T16:28:47.883963",
             "last_status": "success"
+        },
+        "pm@teamglobalexp.com/News Extract": {
+            "email": "pm@teamglobalexp.com",
+            "name": "News Extract",
+            "last_execution": "2026-09-22T15:06:38.018571",
+            "last_status": "success"
         }
     }
 }

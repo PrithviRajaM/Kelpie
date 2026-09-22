@@ -1,33 +1,26 @@
-"""Business logic for profile creation, task management, and log reading.
-
-Ported from the standalone NumbatAPI project and unified under Kelpie. The
-one behavioural change is logging: instead of ``print``, this module uses the
-shared Kelpie logger (``Kelpie/Logger/kelpie_logger.py``) so NumbatAPI activity
-lands in the same global Kelpie log as the rest of the project.
-"""
+"""Business logic for profile creation and validation."""
 from __future__ import annotations
 
 import json
-import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
-# Make the Kelpie project root and its Logger importable so we can reuse the
-# shared logger regardless of the working directory uvicorn is started from.
-# services.py -> app -> NumbatAPI -> Kelpie (root).
-_PROJECT_ROOT = os.path.dirname(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
-_LOGGER_DIR = os.path.join(_PROJECT_ROOT, "Logger")
-if _LOGGER_DIR not in sys.path:
-    sys.path.insert(0, _LOGGER_DIR)
-
-import kelpie_logger as logger  # noqa: E402  (path set up above)
-
 from .config import settings
+
+# The Kelpie project root is two levels up from this file
+# (<kelpie_root>/NumbatAPI/app/services.py). Add it to sys.path so we can reuse
+# the task runner's discovery/execution logic directly.
+_KELPIE_ROOT = Path(__file__).resolve().parents[2]
+if str(_KELPIE_ROOT) not in sys.path:
+    sys.path.insert(0, str(_KELPIE_ROOT))
+
+from Tasks.task_runner import (  # noqa: E402  (import after sys.path tweak)
+    DiscoveredTask,
+    execute_task,
+    load_execution_state,
+)
 from .models import (
     LogDate,
     LogRun,
@@ -36,11 +29,12 @@ from .models import (
     TaskSummary,
 )
 
-SCRIPT_NAME = "services.py"
-
 CONFIG_FILENAME = "TaskConfig.json"
 PROMPT_FILENAME = "TaskPrompt.txt"
 LOGS_DIRNAME = "Logs"
+# Suffix appended to a task folder when it is "deleted". A folder carrying this
+# suffix is ignored by task listings, freeing the original name for reuse.
+DELETED_SUFFIX = "_DELETED"
 
 # Log filenames look like ``task_2026-09-10.log``; capture the date part.
 _LOG_FILENAME_RE = re.compile(r"^task_(\d{4}-\d{2}-\d{2})\.log$", re.IGNORECASE)
@@ -82,10 +76,6 @@ def validate_domain(email: str) -> str:
     """
     local_part, _, domain = email.partition("@")
     if domain.lower() != settings.allowed_domain.lower():
-        logger.log_warning(
-            SCRIPT_NAME,
-            f"Rejected email with disallowed domain: {email!r}",
-        )
         raise DomainNotAllowedError(
             f"Email must be under @{settings.allowed_domain}"
         )
@@ -112,11 +102,9 @@ def process_profile(email: str) -> tuple[str, str, bool]:
     profile_dir = root / email
 
     if profile_dir.exists():
-        logger.log_info(SCRIPT_NAME, f"Existing profile accessed: {email}")
         return f"Well come back {local_part}", local_part, False
 
     profile_dir.mkdir()
-    logger.log_info(SCRIPT_NAME, f"Created new profile: {email}")
     return f"A profile for {local_part} is created", email, True
 
 
@@ -157,6 +145,9 @@ def list_tasks(email: str) -> list[TaskSummary]:
     for entry in sorted(tasks_root.iterdir(), key=lambda p: p.name.lower()):
         if not entry.is_dir():
             continue
+        # Deleted tasks are kept on disk with a suffix but hidden from the UI.
+        if entry.name.endswith(DELETED_SUFFIX):
+            continue
         config_path = entry / CONFIG_FILENAME
         if not config_path.exists():
             continue
@@ -167,11 +158,6 @@ def list_tasks(email: str) -> list[TaskSummary]:
             enabled = bool(data.get("enabled", True))
         except (json.JSONDecodeError, OSError):
             # Keep listing resilient: a malformed config still shows up.
-            logger.log_warning(
-                SCRIPT_NAME,
-                f"Malformed or unreadable config for task '{entry.name}' "
-                f"(user {email}); listing it as enabled.",
-            )
             enabled = True
 
         summaries.append(TaskSummary(name=entry.name, enabled=enabled))
@@ -247,19 +233,58 @@ def save_task(
     prompt_path = task_dir / PROMPT_FILENAME
     prompt_path.write_text(prompt, encoding="utf-8")
 
-    action = "Created" if created else "Updated"
-    logger.log_info(
-        SCRIPT_NAME,
-        f"{action} task '{config.name}' for {email}.",
-    )
     return config.name, created
+
+
+def delete_task(email: str, task_name: str) -> str:
+    """Soft-delete a task by renaming its folder with the ``_DELETED`` suffix.
+
+    The folder is not removed; it is renamed to ``<task_name>_DELETED`` so it is
+    no longer treated as an existing task (listings skip suffixed folders) and
+    the original name becomes available again.
+
+    If a ``<task_name>_DELETED`` folder already exists from a prior deletion, it
+    is hard-deleted first so the current folder can take its place.
+
+    Args:
+        email: The owning user.
+        task_name: Name of the task (folder) to delete.
+
+    Returns:
+        The deleted task's name.
+
+    Raises:
+        ProfileNotFoundError: If the user's profile folder is missing.
+        TaskNotFoundError: If the task folder or its config is missing.
+    """
+    profile_dir = _profile_dir(email)
+    if not profile_dir.exists():
+        raise ProfileNotFoundError(f"No profile found for {email}")
+
+    tasks_root = _tasks_root(email)
+    task_dir = tasks_root / task_name
+    if task_name.endswith(DELETED_SUFFIX) or not (
+        task_dir / CONFIG_FILENAME
+    ).exists():
+        raise TaskNotFoundError(f"Task '{task_name}' not found")
+
+    deleted_dir = tasks_root / f"{task_name}{DELETED_SUFFIX}"
+    if deleted_dir.exists():
+        # A previous deletion still occupies the target name: hard-delete it so
+        # the current folder can be renamed into place.
+        shutil.rmtree(deleted_dir)
+
+    task_dir.rename(deleted_dir)
+    return task_name
 
 
 def run_task(email: str, task_name: str) -> str:
     """Handle an immediate 'run now' request for a task.
 
-    For now this just logs the received request and returns the task name;
-    real execution will be wired up later.
+    Builds the same ``DiscoveredTask`` shape the scheduler uses (the on-disk
+    layout is identical: ``<data_root>/<email>/Tasks/<task_name>``), loads the
+    shared execution state, and hands off to the task runner's ``execute_task``
+    to perform the run immediately, bypassing the enabled/frequency/due checks.
 
     Raises:
         ProfileNotFoundError: If the user's profile folder is missing.
@@ -270,13 +295,28 @@ def run_task(email: str, task_name: str) -> str:
         raise ProfileNotFoundError(f"No profile found for {email}")
 
     task_dir = _tasks_root(email) / task_name
-    if not (task_dir / CONFIG_FILENAME).exists():
+    config_path = task_dir / CONFIG_FILENAME
+    if not config_path.exists():
         raise TaskNotFoundError(f"Task '{task_name}' not found")
 
-    logger.log_info(
-        SCRIPT_NAME,
-        f"Run Now requested: email={email!r} task={task_name!r}",
+    # Parse the task's config so we can resolve its display name the same way
+    # the scheduler does (config 'name' preferred, folder name as fallback).
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config_name = config.get("name") or task_name
+
+    # Assemble the DiscoveredTask the runner expects. The runner resolves all
+    # of its paths (prompt, logs, state key) from these fields.
+    task = DiscoveredTask(
+        email=email,
+        name=task_name,
+        config=config,
+        task_dir=str(task_dir),
+        profile_dir=str(profile_dir),
     )
+
+    state = load_execution_state()
+    execute_task(task, config_name, state)
+
     return task_name
 
 
@@ -348,10 +388,6 @@ def list_log_runs(email: str, task_name: str) -> list[LogDate]:
                         first_seen[run_id] = time_str
         except OSError:
             # Skip unreadable files rather than failing the whole listing.
-            logger.log_warning(
-                SCRIPT_NAME,
-                f"Skipping unreadable log file: {entry}",
-            )
             continue
 
         runs = [

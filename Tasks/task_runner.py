@@ -11,7 +11,9 @@ folder under the Numbat data root:
             └── <task_name>/        # folder name == task name
                 ├── TaskConfig.json # persisted task config
                 ├── TaskPrompt.txt  # prompt text fed to the model
-                └── Logs/           # per-task logs, one file per date
+                ├── Logs/           # per-task logs, one file per date
+                └── InProgress/     # per-task in-progress session artifacts
+                    └── <session_counter>/
 
     The data root comes from the global config (``kelpie_config.json``,
     key ``data_root``); default ``D:\\Data\\Numbat``, overridable per-run via
@@ -65,7 +67,7 @@ TASK_LOGS_DIRNAME = "Logs"
 # Lives directly inside the profile folder: "<DATA_ROOT>/<email>/Task_Config.json".
 PROFILE_CONFIG_FILENAME = "Task_Config.json"
 
-# In-progress session artifacts live under "<profile_dir>/InProgress/<session_counter>".
+# In-progress session artifacts live under "<task_dir>/InProgress/<session_counter>".
 # Each session folder holds the prompt fed to the next bot and a handoff status file.
 INPROGRESS_DIRNAME = "InProgress"
 SESSION_CONTEXT_FILENAME = "session_context.txt"
@@ -261,7 +263,7 @@ def next_session_counter(profile_dir: str) -> int:
 def prepare_session_context(task: "DiscoveredTask", session_counter: int, prompt_content: str) -> str | None:
     """Stage the in-progress session artifacts for a task run.
 
-    Creates ``<profile_dir>/InProgress/<session_counter>/`` and writes:
+    Creates ``<task_dir>/InProgress/<session_counter>/`` and writes:
       - ``session_context.txt``: the raw prompt content handed to the next bot.
       - ``status.json``: a handoff status file (only created if not already
         present) describing the current and next bot and the next action.
@@ -274,7 +276,7 @@ def prepare_session_context(task: "DiscoveredTask", session_counter: int, prompt
     Returns:
         The absolute path to the created session folder, or None on failure.
     """
-    session_dir = os.path.join(task.profile_dir, INPROGRESS_DIRNAME, str(session_counter))
+    session_dir = os.path.join(task.task_dir, INPROGRESS_DIRNAME, str(session_counter))
 
     try:
         os.makedirs(session_dir, exist_ok=True)
@@ -426,6 +428,99 @@ def execute_task(task: "DiscoveredTask", prompt_content: str) -> str | None:
     return response
 
 
+def execute_task(task, config_name: str, state: dict) -> bool:
+    """Run a single, already-qualified task and persist its execution state.
+
+    This is the core execution step, split out so it can be invoked directly
+    (e.g. on demand) without going through the full discover/evaluate loop in
+    ``run_all_tasks``. Callers are responsible for ensuring the task is enabled
+    and due before calling this.
+
+    Args:
+        task: The discovered task to execute.
+        config_name: The resolved display name for the task (config 'name' or
+            folder name), used for logging and state.
+        state: The mutable execution-state dict; updated and saved in place.
+
+    Returns:
+        True if execution succeeded, False otherwise. Returns False if the
+        prompt could not be loaded or the session context could not be staged.
+    """
+    # Guard: if this task already has an in-progress session (any folder inside
+    # its "InProgress" directory), a prior run has not completed its handoff.
+    # Terminate this execution to avoid running the same task concurrently.
+    inprogress_dir = os.path.join(task.task_dir, INPROGRESS_DIRNAME)
+    if os.path.isdir(inprogress_dir):
+        has_session = any(
+            os.path.isdir(os.path.join(inprogress_dir, entry))
+            for entry in os.listdir(inprogress_dir)
+        )
+        if has_session:
+            msg = (
+                f"Task '{config_name}' ({task.email}) execution terminated: "
+                f"the task is already in progress (an active session exists under {inprogress_dir})."
+            )
+            logger.log_warning(SCRIPT_NAME, msg)
+            logger.log_task_warning(task.logs_dir, SCRIPT_NAME, msg)
+            return False
+
+    # Task is qualified to run. Derive a fresh session counter for this
+    # task's profile and persist it immediately; every log line below
+    # (global and per-task) will carry this counter.
+    session_counter = next_session_counter(task.profile_dir)
+
+    logger.log_info(SCRIPT_NAME, f"Task '{config_name}' ({task.email}) has started to run (session {session_counter}).")
+    logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Task '{config_name}' has started to run (session {session_counter}).")
+
+    # Load the task's own prompt
+    prompt_content = load_prompt(task)
+    if prompt_content is None:
+        return False
+
+    # Stage the in-progress session artifacts (session_context.txt +
+    # status.json) under "<task_dir>/InProgress/<session_counter>"
+    # before handing off to execution.
+    session_dir = prepare_session_context(task, session_counter, prompt_content)
+    if session_dir is None:
+        return False
+
+    # Execute the task by publishing a web-extract job to the
+    # Swagman/WebExtract queue (connection/queue settings come from
+    # Messaging/queue.config). This tests the messaging path end to end.
+    try:
+        publish_web_extract(
+            {
+                "task_identifier": session_dir,
+                "web_url": "https://www.news.com.au/",
+                "destination_folder_name": session_dir,
+            },
+            log=lambda m: logger.log_task_info(task.logs_dir, SCRIPT_NAME, m),
+        )
+        response = True
+        logger.log_info(
+            SCRIPT_NAME,
+            f"Task '{config_name}' published a web-extract job (session {session_counter}).",
+        )
+    except PublishError as e:
+        response = False
+        logger.log_error(SCRIPT_NAME, f"Task '{config_name}' failed to publish web-extract job: {e}")
+        logger.log_task_error(task.logs_dir, SCRIPT_NAME, f"Failed to publish web-extract job: {e}")
+
+    # Save execution timestamp regardless of success (to avoid retry storms)
+    if "tasks" not in state:
+        state["tasks"] = {}
+
+    state["tasks"][task.state_key] = {
+        "email": task.email,
+        "name": config_name,
+        "last_execution": datetime.now().isoformat(),
+        "last_status": "success" if response else "failed",
+    }
+    save_execution_state(state)
+
+    return response
+
+
 def run_all_tasks() -> None:
     """Main entry point: discover, evaluate, and run all tasks on disk."""
     logger.log_info(SCRIPT_NAME, "Task runner started.")
@@ -468,59 +563,7 @@ def run_all_tasks() -> None:
         if not is_task_due(task, frequency_minutes, state):
             continue
 
-        # Task is qualified to run. Derive a fresh session counter for this
-        # task's profile and persist it immediately; every log line below
-        # (global and per-task) will carry this counter.
-        session_counter = next_session_counter(task.profile_dir)
-
-        logger.log_info(SCRIPT_NAME, f"Task '{config_name}' ({task.email}) has started to run (session {session_counter}).")
-        logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Task '{config_name}' has started to run (session {session_counter}).")
-
-        # Load the task's own prompt
-        prompt_content = load_prompt(task)
-        if prompt_content is None:
-            continue
-
-        # Stage the in-progress session artifacts (session_context.txt +
-        # status.json) under "<profile_dir>/InProgress/<session_counter>"
-        # before handing off to execution.
-        session_dir = prepare_session_context(task, session_counter, prompt_content)
-        if session_dir is None:
-            continue
-
-        # Execute the task by publishing a web-extract job to the
-        # Swagman/WebExtract queue (connection/queue settings come from
-        # Messaging/queue.config). This tests the messaging path end to end.
-        try:
-            publish_web_extract(
-                {
-                    "task_identifier": session_dir,
-                    "web_url": "https://www.news.com.au/",
-                    "destination_folder_name": session_dir,
-                },
-                log=lambda m: logger.log_task_info(task.logs_dir, SCRIPT_NAME, m),
-            )
-            response = True
-            logger.log_info(
-                SCRIPT_NAME,
-                f"Task '{config_name}' published a web-extract job (session {session_counter}).",
-            )
-        except PublishError as e:
-            response = False
-            logger.log_error(SCRIPT_NAME, f"Task '{config_name}' failed to publish web-extract job: {e}")
-            logger.log_task_error(task.logs_dir, SCRIPT_NAME, f"Failed to publish web-extract job: {e}")
-
-        # Save execution timestamp regardless of success (to avoid retry storms)
-        if "tasks" not in state:
-            state["tasks"] = {}
-
-        state["tasks"][task.state_key] = {
-            "email": task.email,
-            "name": config_name,
-            "last_execution": datetime.now().isoformat(),
-            "last_status": "success" if response else "failed",
-        }
-        save_execution_state(state)
+        execute_task(task, config_name, state)
 
     logger.log_info(SCRIPT_NAME, "Task runner completed.")
 

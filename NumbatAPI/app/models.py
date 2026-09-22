@@ -39,9 +39,16 @@ class TaskConfig(BaseModel):
         description="How often the task runs, in minutes.",
     )
     enabled: bool = Field(default=True, description="Whether the task is active.")
-    web_access: bool = Field(
+    web_extract: bool = Field(
         default=False,
-        description="Whether the task is allowed to access the web.",
+        description="Whether the task is allowed to extract from the web.",
+    )
+    web_urls: str = Field(
+        default="",
+        description=(
+            "One or more URLs to extract from, separated by ';' or ','. "
+            "Persisted regardless of the web_extract flag."
+        ),
     )
 
 
@@ -86,6 +93,13 @@ class SaveTaskResponse(BaseModel):
     message: str
     name: str
     created: bool
+
+
+class DeleteTaskResponse(BaseModel):
+    """Result of deleting (soft-deleting) a task."""
+
+    message: str
+    name: str
 
 
 class RunTaskRequest(BaseModel):

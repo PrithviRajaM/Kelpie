@@ -1,1 +1,1 @@
-"""Numbat API application package (unified under Kelpie)."""
+"""Numbat API application package."""
