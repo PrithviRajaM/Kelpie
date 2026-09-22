@@ -315,9 +315,7 @@ def run_task(email: str, task_name: str) -> str:
     )
 
     state = load_execution_state()
-    execute_task(task, config_name, state)
-
-    return task_name
+    return execute_task(task, config_name, state)
 
 
 def _logs_dir(email: str, task_name: str) -> Path:

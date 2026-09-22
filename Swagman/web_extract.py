@@ -71,6 +71,10 @@ DOWNLOAD_POLL_INTERVAL_SECONDS = 1
 # destination path. Lives at the Kelpie project root (two levels up).
 WEB_ROOT_DIR = os.path.join(PROJECT_ROOT, ".web")
 
+# Subfolder created inside the current task folder to hold captures when no
+# destination_folder_name is supplied (see run_web_extract_task).
+WEB_EXTRACT_SUBDIR = "web_extract"
+
 
 def _sanitize_name(name: str, fallback: str) -> str:
     """Return a filesystem-safe version of a name.
@@ -92,7 +96,7 @@ def _timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
 
-def _build_download_filename(web_url: str, destination_folder_name: str) -> str:
+def _build_download_filename(web_url: str) -> str:
     """Build the download filename for a captured page.
 
     The name combines the destination folder label, the URL host + path slug and
@@ -103,15 +107,13 @@ def _build_download_filename(web_url: str, destination_folder_name: str) -> str:
     The bridge treats this value as a filename only (no folders), so the result
     intentionally contains no path separators.
     """
-    label = _sanitize_name(destination_folder_name, "web_extract")
-
     parsed = urlparse(web_url)
     host = parsed.netloc or "page"
     path_slug = (parsed.path or "").strip("/")
     url_part = f"{host}_{path_slug}" if path_slug else host
     url_part = _sanitize_name(url_part, "page")
 
-    filename = f"{_timestamp()}_{label}_{url_part}.html"
+    filename = f"{_timestamp()}_{url_part}.html"
     # Final safety pass in case sanitization above still left path separators.
     return _sanitize_name(filename, f"web_extract_{_timestamp()}.html")
 
@@ -152,7 +154,7 @@ def _send_to_bridge(web_url: str, filename: str) -> dict:
         }
 
 
-def extract_web_content(web_url: str, destination_folder_name: str) -> str | None:
+def extract_web_content(web_url: str) -> str | None:
     """Ask the Lyrebird extension to download ``web_url`` as a single file.
 
     A download filename is generated from ``destination_folder_name``, the URL
@@ -175,7 +177,7 @@ def extract_web_content(web_url: str, destination_folder_name: str) -> str | Non
         logger.log_error(SCRIPT_NAME, "No web_url provided for web extraction.")
         return None
 
-    filename = _build_download_filename(web_url, destination_folder_name)
+    filename = _build_download_filename(web_url)
 
     logger.log_info(
         SCRIPT_NAME,
@@ -288,11 +290,14 @@ def run_web_extract_task(task: dict) -> str | None:
     Args:
         task: The task definition dict. Expected keys:
             - web_url: URL to download.
-            - destination_folder_name (or destination_folder): label used in the
-              download filename and as the destination folder. A full folder
-              path is used as-is; a plain name is created under ``.web``.
-            - name: (optional) task name, used for logging and as a fallback
-              label.
+            - destination_folder_name (or destination_folder): optional folder
+              the capture is moved into. A full folder path is used as-is; a
+              plain name is created under ``.web``. When omitted, the capture is
+              stored in a ``web_extract`` folder inside the current task folder
+              (``<name>/web_extract``).
+            - name: task name (the task_identifier). Used for logging and, when
+              no destination is supplied, as the task folder the default
+              ``web_extract`` destination is created inside.
 
     Returns:
         The full path of the moved file on success, or None on failure/timeout.
@@ -302,8 +307,19 @@ def run_web_extract_task(task: dict) -> str | None:
     destination_folder = (
         task.get("destination_folder_name")
         or task.get("destination_folder")
-        or task_name
     )
+
+    # destination_folder_name is optional. When it is not supplied, store the
+    # capture in a "web_extract" folder inside the current task folder. The task
+    # folder is the InProgress session folder passed in as the task name
+    # (task_identifier), so the default becomes "<task_name>/web_extract".
+    if not destination_folder:
+        destination_folder = os.path.join(task_name, WEB_EXTRACT_SUBDIR)
+        logger.log_info(
+            SCRIPT_NAME,
+            f"No destination_folder_name provided for task '{task_name}'. "
+            f"Defaulting to '{destination_folder}'.",
+        )
 
     logger.log_info(SCRIPT_NAME, f"Running web_extract task '{task_name}'.")
 
@@ -314,7 +330,7 @@ def run_web_extract_task(task: dict) -> str | None:
     # Step 1: send the capture request. The returned filename is what the
     # extension will save into the Downloads folder. A None result means the
     # request was not successfully sent to the extension.
-    filename = extract_web_content(web_url, destination_folder)
+    filename = extract_web_content(web_url)
     if not filename:
         logger.log_error(
             SCRIPT_NAME,

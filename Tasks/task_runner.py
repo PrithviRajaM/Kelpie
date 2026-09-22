@@ -428,7 +428,7 @@ def execute_task(task: "DiscoveredTask", prompt_content: str) -> str | None:
     return response
 
 
-def execute_task(task, config_name: str, state: dict) -> bool:
+def execute_task(task, config_name: str, state: dict) -> str:
     """Run a single, already-qualified task and persist its execution state.
 
     This is the core execution step, split out so it can be invoked directly
@@ -462,7 +462,7 @@ def execute_task(task, config_name: str, state: dict) -> bool:
             )
             logger.log_warning(SCRIPT_NAME, msg)
             logger.log_task_warning(task.logs_dir, SCRIPT_NAME, msg)
-            return False
+            return "The task execution has been terminated because an earlier instance of the same task is still in progress."
 
     # Task is qualified to run. Derive a fresh session counter for this
     # task's profile and persist it immediately; every log line below
@@ -475,18 +475,19 @@ def execute_task(task, config_name: str, state: dict) -> bool:
     # Load the task's own prompt
     prompt_content = load_prompt(task)
     if prompt_content is None:
-        return False
+        return f"Task prompt is not found"
 
     # Stage the in-progress session artifacts (session_context.txt +
     # status.json) under "<task_dir>/InProgress/<session_counter>"
     # before handing off to execution.
     session_dir = prepare_session_context(task, session_counter, prompt_content)
     if session_dir is None:
-        return False
+        return "Error while creating session directory"
 
     # Execute the task by publishing a web-extract job to the
     # Swagman/WebExtract queue (connection/queue settings come from
     # Messaging/queue.config). This tests the messaging path end to end.
+    logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Task ::: {task.task_dir}")
     try:
         publish_web_extract(
             {
@@ -496,13 +497,13 @@ def execute_task(task, config_name: str, state: dict) -> bool:
             },
             log=lambda m: logger.log_task_info(task.logs_dir, SCRIPT_NAME, m),
         )
-        response = True
+        response = "Request queued for web extract successfully"
         logger.log_info(
             SCRIPT_NAME,
             f"Task '{config_name}' published a web-extract job (session {session_counter}).",
         )
     except PublishError as e:
-        response = False
+        response = "Error while queuing message"
         logger.log_error(SCRIPT_NAME, f"Task '{config_name}' failed to publish web-extract job: {e}")
         logger.log_task_error(task.logs_dir, SCRIPT_NAME, f"Failed to publish web-extract job: {e}")
 

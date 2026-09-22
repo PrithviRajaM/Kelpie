@@ -65,28 +65,36 @@ def _validate_argument(name: str, value) -> str:
     return value.strip()
 
 
-def extract_web_page(task_identifier: str, web_url: str, destination_folder_name: str) -> str | None:
+def extract_web_page(task_identifier: str, web_url: str, destination_folder_name: str | None = None) -> str | None:
     """Public entry point: capture a web page via the Lyrebird extension.
 
-    Validates the three mandatory arguments, assembles a web_extract task, and
+    Validates the mandatory arguments, assembles a web_extract task, and
     delegates to ``run_web_extract_task``.
 
     Args:
         task_identifier: A label identifying this extraction (used for logging
-            and as the task name). Mandatory.
+            and as the task name). Mandatory. When it is an absolute path to the
+            current task's ``InProgress`` session folder, it also determines the
+            default destination (see below).
         web_url: The URL of the page to capture. Mandatory.
-        destination_folder_name: The folder name (or absolute path) the captured
-            page is moved into. Mandatory.
+        destination_folder_name: Optional. The folder name (or absolute path)
+            the captured page is moved into. When omitted or blank, the capture
+            is stored in a ``web_extract`` folder inside the current task folder
+            (i.e. ``<task_identifier>/web_extract``).
 
     Returns:
         The full path of the captured file on success, or None on failure.
 
     Raises:
-        ValueError: If any of the three arguments is missing or blank.
+        ValueError: If ``task_identifier`` or ``web_url`` is missing or blank.
     """
     task_identifier = _validate_argument("task_identifier", task_identifier)
     web_url = _validate_argument("web_url", web_url)
-    destination_folder_name = _validate_argument("destination_folder_name", destination_folder_name)
+
+    # destination_folder_name is optional; normalize a blank value to None so
+    # run_web_extract_task can apply its default.
+    if isinstance(destination_folder_name, str):
+        destination_folder_name = destination_folder_name.strip() or None
 
     logger.log_info(
         SCRIPT_NAME,
