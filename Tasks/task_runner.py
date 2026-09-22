@@ -44,6 +44,7 @@ import kelpie_logger as logger
 import config as kelpie_config
 from Tasks.prompt_builders import build_prompt
 from ollama_client import load_config as load_ollama_config, get_client, resolve_model, send_message
+from Messaging.queue_publisher import publish_web_extract, PublishError
 
 SCRIPT_NAME = "task_runner.py"
 
@@ -63,6 +64,12 @@ TASK_LOGS_DIRNAME = "Logs"
 # Per-profile config file (holds that profile's incrementing session counter).
 # Lives directly inside the profile folder: "<DATA_ROOT>/<email>/Task_Config.json".
 PROFILE_CONFIG_FILENAME = "Task_Config.json"
+
+# In-progress session artifacts live under "<profile_dir>/InProgress/<session_counter>".
+# Each session folder holds the prompt fed to the next bot and a handoff status file.
+INPROGRESS_DIRNAME = "InProgress"
+SESSION_CONTEXT_FILENAME = "session_context.txt"
+STATUS_FILENAME = "status.json"
 
 # Execution state stays local to the Kelpie install (not per-profile).
 EXECUTION_STATE_PATH = os.path.join(TASKS_DIR, "task_execution_state.json")
@@ -251,6 +258,66 @@ def next_session_counter(profile_dir: str) -> int:
     return new_counter
 
 
+def prepare_session_context(task: "DiscoveredTask", session_counter: int, prompt_content: str) -> str | None:
+    """Stage the in-progress session artifacts for a task run.
+
+    Creates ``<profile_dir>/InProgress/<session_counter>/`` and writes:
+      - ``session_context.txt``: the raw prompt content handed to the next bot.
+      - ``status.json``: a handoff status file (only created if not already
+        present) describing the current and next bot and the next action.
+
+    Args:
+        task: The task being run.
+        session_counter: The counter for this run (used as the folder name).
+        prompt_content: The prompt text to persist as the session context.
+
+    Returns:
+        The absolute path to the created session folder, or None on failure.
+    """
+    session_dir = os.path.join(task.profile_dir, INPROGRESS_DIRNAME, str(session_counter))
+
+    try:
+        os.makedirs(session_dir, exist_ok=True)
+    except OSError as e:
+        msg = f"Failed to create session folder for task '{task.name}': {e}"
+        logger.log_error(SCRIPT_NAME, msg)
+        logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
+        return None
+
+    # Persist the prompt content as the session context for the next bot.
+    context_path = os.path.join(session_dir, SESSION_CONTEXT_FILENAME)
+    try:
+        with open(context_path, "w", encoding="utf-8") as f:
+            f.write(prompt_content)
+    except OSError as e:
+        msg = f"Failed to write {SESSION_CONTEXT_FILENAME} for task '{task.name}': {e}"
+        logger.log_error(SCRIPT_NAME, msg)
+        logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
+        return None
+
+    # Create the handoff status file only if it does not already exist.
+    status_path = os.path.join(session_dir, STATUS_FILENAME)
+    if not os.path.isfile(status_path):
+        status = {
+            "Current_bot": "Kelpie - Task Scheduler",
+            "Next_bot": "Magpie - AI Agent",
+            "Next_Action": "Analyse and start the Task",
+        }
+        try:
+            with open(status_path, "w", encoding="utf-8") as f:
+                json.dump(status, f, indent=4)
+        except OSError as e:
+            msg = f"Failed to write {STATUS_FILENAME} for task '{task.name}': {e}"
+            logger.log_error(SCRIPT_NAME, msg)
+            logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
+            return None
+
+    logger.log_info(SCRIPT_NAME, f"Session context staged for task '{task.name}' at {session_dir}.")
+    logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Session context staged at {session_dir}.")
+
+    return session_dir
+
+
 def is_task_due(task: "DiscoveredTask", frequency_minutes: int, state: dict) -> bool:
     """Determine whether a task is due for execution based on its frequency.
 
@@ -280,8 +347,8 @@ def is_task_due(task: "DiscoveredTask", frequency_minutes: int, state: dict) -> 
     if now >= next_due:
         elapsed = (now - last_run).total_seconds() / 60
         msg = f"Task '{task.name}' is due. Last ran {elapsed:.1f} min ago (frequency: {frequency_minutes} min)."
-        logger.log_info(SCRIPT_NAME, msg)
-        logger.log_task_info(task.logs_dir, SCRIPT_NAME, msg)
+        #logger.log_info(SCRIPT_NAME, msg)
+        #logger.log_task_info(task.logs_dir, SCRIPT_NAME, msg)
         return True
 
     remaining = (next_due - now).total_seconds() / 60
@@ -414,8 +481,34 @@ def run_all_tasks() -> None:
         if prompt_content is None:
             continue
 
-        # Execute the task
-        response = "Task skipped" #execute_task(task, prompt_content)
+        # Stage the in-progress session artifacts (session_context.txt +
+        # status.json) under "<profile_dir>/InProgress/<session_counter>"
+        # before handing off to execution.
+        session_dir = prepare_session_context(task, session_counter, prompt_content)
+        if session_dir is None:
+            continue
+
+        # Execute the task by publishing a web-extract job to the
+        # Swagman/WebExtract queue (connection/queue settings come from
+        # Messaging/queue.config). This tests the messaging path end to end.
+        try:
+            publish_web_extract(
+                {
+                    "task_identifier": session_dir,
+                    "web_url": "https://www.news.com.au/",
+                    "destination_folder_name": session_dir,
+                },
+                log=lambda m: logger.log_task_info(task.logs_dir, SCRIPT_NAME, m),
+            )
+            response = True
+            logger.log_info(
+                SCRIPT_NAME,
+                f"Task '{config_name}' published a web-extract job (session {session_counter}).",
+            )
+        except PublishError as e:
+            response = False
+            logger.log_error(SCRIPT_NAME, f"Task '{config_name}' failed to publish web-extract job: {e}")
+            logger.log_task_error(task.logs_dir, SCRIPT_NAME, f"Failed to publish web-extract job: {e}")
 
         # Save execution timestamp regardless of success (to avoid retry storms)
         if "tasks" not in state:

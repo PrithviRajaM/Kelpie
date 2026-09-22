@@ -9,5 +9,5 @@
         "qwen3.5:9b",
         "qwen3.5:4b"
     ],
-    "default_model": "qwen3.5:9b"
+    "default_model": "qwen3.5:4b"
 }
