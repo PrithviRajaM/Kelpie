@@ -270,6 +270,19 @@ def publish_message(
                 f"Published message to queue '{settings.queue}' on "
                 f"{settings.host}:{settings.port}."
             )
+
+        # A message now exists to be consumed. Wake the centralised consumer
+        # dispatcher so all consumers are drained; it is a no-op if a dispatch
+        # loop is already running. This is best-effort: any failure here (or the
+        # dispatcher simply not being present, e.g. in a vendored copy) must
+        # never turn a successful publish into a failure, so it is isolated in
+        # its own try/except and imported lazily.
+        if log:
+            log(
+                f"Triggering consumer dispatcher after publish to "
+                f"'{settings.queue}'."
+            )
+        _trigger_consumer_dispatch(log=log)
     except PublishError:
         raise
     except Exception as exc:  # pika raises a variety of connection errors
@@ -284,6 +297,37 @@ def publish_message(
             except Exception:
                 # Closing failures must not mask a successful publish.
                 pass
+
+
+def _trigger_consumer_dispatch(*, log: Optional[Callable[[str], None]] = None) -> None:
+    """Wake the centralised consumer dispatcher after a publish (best effort).
+
+    The dispatcher (``Messaging/consumer_dispatcher.py``) drains every consumer
+    on a loop until all queues are empty, running as a detached process so it
+    is independent of this publisher. ``start_if_idle`` does nothing if a loop
+    is already running, so calling this on every publish is safe.
+
+    This is deliberately isolated and lazily imported: the publisher stays a
+    self-contained module (stdlib + pika only) that can be vendored into other
+    bots without the dispatcher, and any dispatch failure must never turn a
+    successful publish into a failure.
+    """
+    try:
+        from Messaging.consumer_dispatcher import start_if_idle
+    except Exception:
+        try:
+            # Fallback when imported outside the package namespace.
+            from consumer_dispatcher import start_if_idle  # type: ignore
+        except Exception:
+            return
+
+    try:
+        started = start_if_idle()
+        if started and log:
+            log("Consumer dispatcher started to drain queued messages.")
+    except Exception:
+        # Never let triggering the dispatcher affect the publish result.
+        pass
 
 
 def _encode_payload(payload: Any) -> str:
@@ -337,4 +381,105 @@ def publish_web_extract(
             publishing fails.
     """
     settings = _settings_for(WEB_EXTRACT_CONFIG_KEY)
+    publish_message(settings, payload, log=log)
+
+
+# ---------------------------------------------------------------------------
+# Convenience: the local_AI queue
+#
+# The local AI model (Ollama) cannot reach the internet by itself. When a step
+# in a task's action plan is owned by Ollama, a message is published here so the
+# local-AI consumer (Tasks/local_ai_consumer.py) can resume the model on that
+# step. Connection and queue settings come from the ``local_AI`` entry in
+# ``queue.config``. The message contract is::
+#
+#     {
+#         "task_identifier": "<absolute path to the InProgress session folder>",
+#         "step_id": 2
+#     }
+# ---------------------------------------------------------------------------
+
+#: Config key (under ``queues`` in ``queue.config``) for the local-AI queue.
+LOCAL_AI_CONFIG_KEY = "local_AI"
+
+
+def publish_local_ai(
+    payload: Any,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Publish a single resume request to the ``local_AI`` queue.
+
+    Convenience wrapper around :func:`publish_message`. Connection and queue
+    settings are read from ``queue.config`` (the ``local_AI`` entry), so the
+    caller supplies only the payload. The message contract expected by the
+    consumer is::
+
+        {
+            "task_identifier": "<InProgress session folder>",
+            "step_id": 2
+        }
+
+    Args:
+        payload: The job body (typically the dict shown above).
+        log: Optional progress/info callback forwarded to
+            :func:`publish_message`.
+
+    Raises:
+        PublishError: If pika is unavailable, the queue is not configured, or
+            publishing fails.
+    """
+    settings = _settings_for(LOCAL_AI_CONFIG_KEY)
+    publish_message(settings, payload, log=log)
+
+
+# ---------------------------------------------------------------------------
+# Convenience: the fallback (orchestrator) queue
+#
+# Every action owner (Swagman, Ollama, ...) posts a step-status message to this
+# queue when it finishes its step. The fallback consumer
+# (Tasks/fallback_consumer.py) updates the action plan with the reported status
+# and then advances the task by posting the next step to its owner's queue.
+# Connection and queue settings come from the ``fallback`` entry in
+# ``queue.config``. The message contract is::
+#
+#     {
+#         "task_identifier": "<absolute path to the InProgress session folder>",
+#         "step_id": 1,
+#         "status": "completed"        # or "failed"
+#     }
+# ---------------------------------------------------------------------------
+
+#: Config key (under ``queues`` in ``queue.config``) for the fallback queue.
+FALLBACK_CONFIG_KEY = "fallback"
+
+
+def publish_fallback(
+    payload: Any,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Publish a single step-status message to the ``fallback`` queue.
+
+    Convenience wrapper around :func:`publish_message`. Connection and queue
+    settings are read from ``queue.config`` (the ``fallback`` entry), so the
+    caller supplies only the payload. The message contract expected by the
+    orchestrator is::
+
+        {
+            "task_identifier": "<InProgress session folder>",
+            "step_id": 1,
+            "status": "completed"
+        }
+
+    Args:
+        payload: The step-status body (typically the dict shown above).
+        log: Optional progress/info callback forwarded to
+            :func:`publish_message`.
+
+    Raises:
+        PublishError: If pika is unavailable, the queue is not configured, or
+            publishing fails.
+    """
+    settings = _settings_for(FALLBACK_CONFIG_KEY)
     publish_message(settings, payload, log=log)

@@ -19,6 +19,8 @@ from .models import (
     RunTaskResponse,
     SaveTaskRequest,
     SaveTaskResponse,
+    StopTaskRequest,
+    StopTaskResponse,
     TaskDetailResponse,
     TaskListResponse,
 )
@@ -36,6 +38,7 @@ from .services import (
     process_profile,
     run_task,
     save_task,
+    stop_task,
 )
 
 app = FastAPI(
@@ -187,6 +190,27 @@ def run_task_now(task_name: str, payload: RunTaskRequest) -> RunTaskResponse:
     return RunTaskResponse(message=f"Run requested for '{name}'", name=name)
 
 
+@app.post("/tasks/{task_name}/stop", response_model=StopTaskResponse)
+def stop_task_now(task_name: str, payload: StopTaskRequest) -> StopTaskResponse:
+    """Stop a task by hard-deleting its ``InProgress`` folder.
+
+    Recursively removes ``<profile>/Tasks/<task_name>/InProgress`` to cancel any
+    staged/in-progress work. The delete is idempotent: it succeeds even if no
+    in-progress folder is present.
+
+    - 400 if the email domain is not allowed.
+    - 404 if the profile or task does not exist.
+    """
+    try:
+        name = stop_task(str(payload.email), task_name)
+    except DomainNotAllowedError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (ProfileNotFoundError, TaskNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return StopTaskResponse(message=f"Task '{name}' stopped", name=name)
+
+
 @app.get("/tasks/{task_name}/logs", response_model=LogRunListResponse)
 def get_task_log_runs(task_name: str, email: str) -> LogRunListResponse:
     """List a task's log dates and the runs within each (no log lines).
@@ -235,3 +259,25 @@ def get_task_log_run_lines(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return LogLinesResponse(date=date, task_run_id=task_run_id, lines=lines)
+
+
+def main() -> None:
+    """Run the API with uvicorn using the project's default settings.
+
+    Host, port and reload can be overridden via environment variables:
+    ``NUMBAT_HOST``, ``NUMBAT_PORT``, ``NUMBAT_RELOAD``.
+    """
+    import os
+
+    import uvicorn
+
+    host = os.getenv("NUMBAT_HOST", "127.0.0.1")
+    port = int(os.getenv("NUMBAT_PORT", "7531"))
+    reload = os.getenv("NUMBAT_RELOAD", "true").lower() in {"1", "true", "yes"}
+
+    # Pass the app as an import string so --reload works.
+    uvicorn.run("app.main:app", host=host, port=port, reload=reload)
+
+
+if __name__ == "__main__":
+    main()

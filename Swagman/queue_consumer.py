@@ -78,6 +78,8 @@ if _LOGGER_DIR not in sys.path:
 
 import kelpie_logger as logger
 from swagman import extract_web_page
+from Tasks import action_plan
+from Messaging.queue_publisher import publish_fallback, PublishError
 
 try:
     import pika
@@ -211,6 +213,68 @@ def _extract_job_fields(job: dict) -> tuple[str, str, str]:
     return task_identifier, web_url, destination_folder_name
 
 
+def _extract_step_id(job: dict) -> Optional[int]:
+    """Return the optional action-plan ``step_id`` from a job, or None.
+
+    Web-extract jobs published as part of a task's action plan carry the id of
+    the Swagman step they belong to, so the outcome can be recorded against that
+    step and its completion reported to the fallback orchestrator. Standalone
+    jobs (published without a plan) simply omit it.
+    """
+    for key in ("step_id", "step", "id"):
+        if key in job and job[key] is not None:
+            try:
+                return int(job[key])
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
+def _report_step_progress(
+    session_dir: str, step_id: int, web_url: str, result_path: Optional[str]
+) -> None:
+    """Record a URL's outcome in action_detail.txt and, when the Swagman step is
+    complete, post its status to the fallback queue.
+
+    A Swagman step may span several URLs (one message each). Each URL's outcome
+    is appended to ``action_detail.txt`` under the step's heading. Only once all
+    of the step's expected URLs have been processed is a single status message
+    posted to the fallback orchestrator so it can advance the plan.
+    """
+    # Record this URL -> filename (or failure) under the step heading.
+    if result_path:
+        outcome = f"URL: {web_url}\n  -> extracted file: {result_path}"
+    else:
+        outcome = f"URL: {web_url}\n  -> extraction FAILED (no file produced)."
+    action_plan.append_detail(session_dir, step_id, action_plan.OWNER_SWAGMAN, outcome)
+
+    # Update per-URL bookkeeping; only advance the plan when the step is done.
+    step_complete = action_plan.record_web_extract(
+        session_dir, step_id, web_url, result_path
+    )
+    if not step_complete:
+        return
+
+    status = action_plan.STATUS_COMPLETED if result_path else action_plan.STATUS_FAILED
+    try:
+        publish_fallback(
+            {
+                "task_identifier": session_dir,
+                "step_id": step_id,
+                "status": status,
+            }
+        )
+        logger.log_info(
+            SCRIPT_NAME,
+            f"Swagman step {step_id} for '{session_dir}' reported '{status}' to fallback.",
+        )
+    except PublishError as exc:
+        logger.log_error(
+            SCRIPT_NAME,
+            f"Failed to post fallback status for '{session_dir}' step {step_id}: {exc}.",
+        )
+
+
 def _handle_message(channel, method, properties, body) -> None:
     """pika callback: process one delivery and ack/nack it.
 
@@ -222,6 +286,7 @@ def _handle_message(channel, method, properties, body) -> None:
     try:
         job = _decode_payload(body)
         task_identifier, web_url, destination_folder_name = _extract_job_fields(job)
+        step_id = _extract_step_id(job)
     except ValueError as exc:
         logger.log_error(
             SCRIPT_NAME,
@@ -263,6 +328,20 @@ def _handle_message(channel, method, properties, body) -> None:
             SCRIPT_NAME,
             f"Job '{task_identifier}' did not produce a file (see log above).",
         )
+
+    # When this job is part of a task's action plan (step_id present), record the
+    # outcome into action_detail.txt and, once the Swagman step's URLs are all
+    # done, report the step status to the fallback orchestrator so the local AI
+    # step can resume. task_identifier is the InProgress session folder.
+    if step_id is not None:
+        try:
+            _report_step_progress(task_identifier, step_id, web_url, result_path)
+        except Exception as exc:  # noqa: BLE001 - never fail the ack on reporting
+            logger.log_error(
+                SCRIPT_NAME,
+                f"Failed to report step progress for '{task_identifier}' "
+                f"step {step_id}: {exc}.",
+            )
 
     # The job was handled (success or clean failure); remove it from the queue.
     channel.basic_ack(delivery_tag=delivery_tag)

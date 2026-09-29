@@ -25,7 +25,19 @@
         "pm@teamglobalexp.com/News Extract": {
             "email": "pm@teamglobalexp.com",
             "name": "News Extract",
-            "last_execution": "2026-09-22T16:37:34.170573",
+            "last_execution": "2026-09-23T15:55:45.621830",
+            "last_status": "success"
+        },
+        "pm@teamglobalexp.com/Get Web Data": {
+            "email": "pm@teamglobalexp.com",
+            "name": "Get Web Data",
+            "last_execution": "2026-09-23T14:26:14.941019",
+            "last_status": "success"
+        },
+        "pm@teamglobalexp.com/News Extract Short": {
+            "email": "pm@teamglobalexp.com",
+            "name": "News Extract Short",
+            "last_execution": "2026-09-29T11:50:24.425522",
             "last_status": "success"
         }
     }

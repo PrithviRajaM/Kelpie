@@ -32,6 +32,7 @@ from .models import (
 CONFIG_FILENAME = "TaskConfig.json"
 PROMPT_FILENAME = "TaskPrompt.txt"
 LOGS_DIRNAME = "Logs"
+INPROGRESS_DIRNAME = "InProgress"
 # Suffix appended to a task folder when it is "deleted". A folder carrying this
 # suffix is ignored by task listings, freeing the original name for reuse.
 DELETED_SUFFIX = "_DELETED"
@@ -316,6 +317,42 @@ def run_task(email: str, task_name: str) -> str:
 
     state = load_execution_state()
     return execute_task(task, config_name, state)
+
+
+def stop_task(email: str, task_name: str) -> str:
+    """Stop a task by hard-deleting its ``InProgress`` folder.
+
+    The in-progress working directory lives at
+    ``<profile>/Tasks/<task_name>/InProgress``. Removing it recursively cancels
+    any work staged for the task. Deleting is idempotent: if the folder is
+    already absent the call still succeeds.
+
+    Args:
+        email: The owning user.
+        task_name: Name of the task whose in-progress work to remove.
+
+    Returns:
+        The stopped task's name.
+
+    Raises:
+        ProfileNotFoundError: If the user's profile folder is missing.
+        TaskNotFoundError: If the task folder or its config is missing.
+    """
+    profile_dir = _profile_dir(email)
+    if not profile_dir.exists():
+        raise ProfileNotFoundError(f"No profile found for {email}")
+
+    task_dir = _tasks_root(email) / task_name
+    if task_name.endswith(DELETED_SUFFIX) or not (
+        task_dir / CONFIG_FILENAME
+    ).exists():
+        raise TaskNotFoundError(f"Task '{task_name}' not found")
+
+    inprogress_dir = task_dir / INPROGRESS_DIRNAME
+    if inprogress_dir.exists():
+        shutil.rmtree(inprogress_dir)
+
+    return task_name
 
 
 def _logs_dir(email: str, task_name: str) -> Path:

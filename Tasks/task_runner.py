@@ -45,8 +45,13 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "Ollama"))
 import kelpie_logger as logger
 import config as kelpie_config
 from Tasks.prompt_builders import build_prompt
+from Tasks import action_plan
 from ollama_client import load_config as load_ollama_config, get_client, resolve_model, send_message
-from Messaging.queue_publisher import publish_web_extract, PublishError
+from Messaging.queue_publisher import (
+    publish_web_extract,
+    publish_local_ai,
+    PublishError,
+)
 
 SCRIPT_NAME = "task_runner.py"
 
@@ -283,7 +288,6 @@ def prepare_session_context(task: "DiscoveredTask", session_counter: int, prompt
     except OSError as e:
         msg = f"Failed to create session folder for task '{task.name}': {e}"
         logger.log_error(SCRIPT_NAME, msg)
-        logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
         return None
 
     # Persist the prompt content as the session context for the next bot.
@@ -294,7 +298,6 @@ def prepare_session_context(task: "DiscoveredTask", session_counter: int, prompt
     except OSError as e:
         msg = f"Failed to write {SESSION_CONTEXT_FILENAME} for task '{task.name}': {e}"
         logger.log_error(SCRIPT_NAME, msg)
-        logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
         return None
 
     # Create the handoff status file only if it does not already exist.
@@ -311,11 +314,9 @@ def prepare_session_context(task: "DiscoveredTask", session_counter: int, prompt
         except OSError as e:
             msg = f"Failed to write {STATUS_FILENAME} for task '{task.name}': {e}"
             logger.log_error(SCRIPT_NAME, msg)
-            logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
             return None
 
     logger.log_info(SCRIPT_NAME, f"Session context staged for task '{task.name}' at {session_dir}.")
-    logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Session context staged at {session_dir}.")
 
     return session_dir
 
@@ -367,7 +368,6 @@ def load_prompt(task: "DiscoveredTask") -> str | None:
     if not os.path.isfile(task.prompt_path):
         msg = f"Prompt not found for task '{task.name}': {task.prompt_path}"
         logger.log_error(SCRIPT_NAME, msg)
-        logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
         return None
 
     try:
@@ -376,56 +376,188 @@ def load_prompt(task: "DiscoveredTask") -> str | None:
     except IOError as e:
         msg = f"Failed to read prompt for '{task.name}': {e}"
         logger.log_error(SCRIPT_NAME, msg)
-        logger.log_task_error(task.logs_dir, SCRIPT_NAME, msg)
         return None
 
 
-def execute_task(task: "DiscoveredTask", prompt_content: str) -> str | None:
-    """Execute a task: build prompt, call Ollama, return the response.
+def run_ollama(prompt: str, logs_dir: str | None = None) -> str | None:
+    """Send a prompt to the configured local Ollama model and return the reply.
 
-    All progress is mirrored into the task's own Logs folder so each task's
-    run history lives alongside its config and prompt.
+    This is the low-level "engage the local AI model" helper. It is used by the
+    local-AI step of a task's action plan (via the local_AI queue consumer) and
+    is safe to call from any process that has imported this module. All progress
+    is mirrored into ``logs_dir`` when one is supplied.
+
+    Args:
+        prompt: The fully-built prompt to send to the model.
+        logs_dir: Optional task Logs folder to mirror progress into.
+
+    Returns:
+        The model's reply text, or None if the model could not be reached or
+        returned nothing.
     """
-    logs_dir = task.logs_dir
-
-    # Build prompt using the extensible prompt builder
-    prompt = build_prompt(task.name, prompt_content)
-    logger.log_info(SCRIPT_NAME, f"Prompt built for task '{task.name}': {prompt[:100]}...")
-    logger.log_task_info(logs_dir, SCRIPT_NAME, f"Prompt built for task '{task.name}'.")
-
-    # Load Ollama config
-    try:
-        ollama_config = load_ollama_config()
-    except Exception as e:
-        msg = f"Failed to load Ollama config for task '{task.name}': {e}"
-        logger.log_error(SCRIPT_NAME, msg)
-        logger.log_task_error(logs_dir, SCRIPT_NAME, msg)
-        return None
-
-    try:
-        client = get_client(ollama_config)
-        model = resolve_model(None, ollama_config)
-        keep_alive = ollama_config.get("keep_alive", "5m")
-    except Exception as e:
-        msg = f"Failed to initialize Ollama client for task '{task.name}': {e}"
-        logger.log_error(SCRIPT_NAME, msg)
-        logger.log_task_error(logs_dir, SCRIPT_NAME, msg)
-        return None
-
-    logger.log_info(SCRIPT_NAME, f"Task '{task.name}' calling Ollama model '{model}'...")
-    logger.log_task_info(logs_dir, SCRIPT_NAME, f"Calling Ollama model '{model}'.")
-    response = send_message(client, model, prompt, keep_alive)
-
-    if response:
-        logger.log_info(SCRIPT_NAME, f"Task '{task.name}' completed. Response length: {len(response)} chars.")
-        logger.log_info(SCRIPT_NAME, f"Task '{task.name}' response: {response[:500]}")
-        logger.log_task_info(logs_dir, SCRIPT_NAME, f"Completed. Response length: {len(response)} chars.")
+    # When called during an active task session, plain log_* calls are already
+    # routed to the task's own log; ``logs_dir`` is retained for backward
+    # compatibility and to force task logging even if no session is active.
+    if logs_dir and logger.active_task_logs_dir() is None:
+        logger.begin_task_session(logs_dir)
+        _opened_session = True
     else:
-        msg = f"Task '{task.name}' received no response from Ollama."
-        logger.log_error(SCRIPT_NAME, msg)
-        logger.log_task_error(logs_dir, SCRIPT_NAME, msg)
+        _opened_session = False
 
-    return response
+    try:
+        try:
+            ollama_config = load_ollama_config()
+        except Exception as e:
+            logger.log_error(SCRIPT_NAME, f"Failed to load Ollama config: {e}")
+            return None
+
+        try:
+            client = get_client(ollama_config)
+            model = resolve_model(None, ollama_config)
+            keep_alive = ollama_config.get("keep_alive", "5m")
+        except Exception as e:
+            logger.log_error(SCRIPT_NAME, f"Failed to initialize Ollama client: {e}")
+            return None
+
+        logger.log_info(SCRIPT_NAME, f"Calling Ollama model '{model}'...")
+        response = send_message(client, model, prompt, keep_alive)
+
+        if response:
+            logger.log_info(SCRIPT_NAME, f"Ollama completed. Response length: {len(response)} chars.")
+        else:
+            logger.log_error(SCRIPT_NAME, "Received no response from Ollama.")
+
+        return response
+    finally:
+        if _opened_session:
+            logger.end_task_session()
+
+
+def _web_extract_enabled(config: dict) -> bool:
+    """Return True when the task config enables web extraction.
+
+    Supports the newer ``web_extract`` flag and falls back to the original
+    ``web_access`` flag documented in TASKS.md, so existing configs keep working.
+    """
+    value = config.get("web_extract")
+    if value is None:
+        value = config.get("web_access", False)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _web_urls(config: dict) -> list:
+    """Return the list of URLs to extract from the task config.
+
+    Accepts ``web_urls`` (a list, or a single string) and tolerates a legacy
+    single ``web_url`` key. Blank/non-string entries are dropped.
+    """
+    raw = config.get("web_urls")
+    if raw is None:
+        raw = config.get("web_url")
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    return [u.strip() for u in raw if isinstance(u, str) and u.strip()]
+
+
+def _build_action_plan_steps(config: dict) -> list:
+    """Build the ordered action-plan steps for a task run.
+
+    When web extraction is enabled and URLs are configured, the first step is
+    owned by Swagman (extract the web content) and the second by Ollama (engage
+    the local AI model on the extracted content). Otherwise the plan is a single
+    Ollama step.
+    """
+    steps = []
+    step_id = 1
+
+    if _web_extract_enabled(config):
+        urls = _web_urls(config)
+        if urls:
+            swagman_step = action_plan.make_step(
+                step_id,
+                action_plan.OWNER_SWAGMAN,
+                f"Extract web content for {len(urls)} configured URL(s): "
+                + ", ".join(urls),
+            )
+            # Record the URLs this step expects so its completion can be tracked
+            # as each per-URL web-extract job reports back.
+            swagman_step["web_urls"] = urls
+            swagman_step["completed_urls"] = []
+            steps.append(swagman_step)
+            step_id += 1
+
+    steps.append(
+        action_plan.make_step(
+            step_id,
+            action_plan.OWNER_OLLAMA,
+            "Engage the local AI model to analyse the task prompt and any "
+            "extracted resources, then complete the task or request more "
+            "resources.",
+        )
+    )
+    return steps
+
+
+def _start_step(session_dir: str, step: dict, config: dict, logs_dir: str) -> bool:
+    """Mark a step in progress and publish it to its action owner's queue.
+
+    The step's status is set to ``in progress`` first (so a crash after the
+    publish cannot leave a step looking un-started), then the appropriate
+    owner queue receives the job. Returns True if the job was published.
+    """
+    owner = step.get("action_owner")
+    step_id = step.get("step_id")
+
+    action_plan.update_step_status(session_dir, step_id, action_plan.STATUS_IN_PROGRESS)
+
+    # While a task session is active, plain log_* calls already route to the
+    # task log; the publisher takes an explicit callback, so point it at the
+    # active task log (falling back to logs_dir) to keep publish events on the
+    # task's own log too.
+    log = lambda m: logger.log_info(SCRIPT_NAME, m)
+
+    try:
+        if owner == action_plan.OWNER_SWAGMAN:
+            urls = _web_urls(config)
+            for url in urls:
+                publish_web_extract(
+                    {
+                        "task_identifier": session_dir,
+                        "web_url": url,
+                        "destination_folder_name": session_dir,
+                        "step_id": step_id,
+                    },
+                    log=log,
+                )
+            logger.log_info(
+                SCRIPT_NAME,
+                f"Published {len(urls)} web-extract job(s) for step {step_id}.",
+            )
+            return True
+
+        if owner == action_plan.OWNER_OLLAMA:
+            publish_local_ai(
+                {"task_identifier": session_dir, "step_id": step_id},
+                log=log,
+            )
+            logger.log_info(SCRIPT_NAME, f"Published local-AI job for step {step_id}.")
+            return True
+
+        msg = f"Unknown action owner '{owner}' for step {step_id}; cannot start."
+        logger.log_error(SCRIPT_NAME, msg)
+        action_plan.update_step_status(session_dir, step_id, action_plan.STATUS_FAILED)
+        return False
+    except PublishError as e:
+        msg = f"Failed to publish step {step_id} ({owner}) job: {e}"
+        logger.log_error(SCRIPT_NAME, msg)
+        action_plan.update_step_status(session_dir, step_id, action_plan.STATUS_FAILED)
+        return False
 
 
 def execute_task(task, config_name: str, state: dict) -> str:
@@ -466,11 +598,29 @@ def execute_task(task, config_name: str, state: dict) -> str:
 
     # Task is qualified to run. Derive a fresh session counter for this
     # task's profile and persist it immediately; every log line below
-    # (global and per-task) will carry this counter.
+    # will carry this counter.
     session_counter = next_session_counter(task.profile_dir)
 
+    # Activate the task session so that, from here until the run completes,
+    # every log line - including nested calls into Ollama, Swagman and
+    # Messaging - is written to this task's own log instead of the global log.
+    logger.begin_task_session(task.logs_dir)
+    try:
+        return _run_qualified_task(task, config_name, state, session_counter)
+    finally:
+        # Always revert to global logging once the run has been handed off.
+        logger.end_task_session()
+
+
+def _run_qualified_task(task, config_name: str, state: dict, session_counter: int) -> str:
+    """Body of ``execute_task`` that runs while the task session is active.
+
+    Split out so ``execute_task`` can guarantee (via try/finally) that the
+    task session is ended no matter how this returns. Every ``logger.log_*``
+    call here is routed to the task's own log by the active session, so the
+    previous explicit ``log_task_*`` mirror calls are no longer needed.
+    """
     logger.log_info(SCRIPT_NAME, f"Task '{config_name}' ({task.email}) has started to run (session {session_counter}).")
-    logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Task '{config_name}' has started to run (session {session_counter}).")
 
     # Load the task's own prompt
     prompt_content = load_prompt(task)
@@ -484,28 +634,51 @@ def execute_task(task, config_name: str, state: dict) -> str:
     if session_dir is None:
         return "Error while creating session directory"
 
-    # Execute the task by publishing a web-extract job to the
-    # Swagman/WebExtract queue (connection/queue settings come from
-    # Messaging/queue.config). This tests the messaging path end to end.
-    logger.log_task_info(task.logs_dir, SCRIPT_NAME, f"Task ::: {task.task_dir}")
-    try:
-        publish_web_extract(
-            {
-                "task_identifier": session_dir,
-                "web_url": "https://www.news.com.au/",
-                "destination_folder_name": session_dir,
-            },
-            log=lambda m: logger.log_task_info(task.logs_dir, SCRIPT_NAME, m),
+    # ------------------------------------------------------------------
+    # Build the action plan and start driving it.
+    #
+    # The plan is created first and stored in the session folder as
+    # action_plan.json. When web_extract is enabled with configured URLs, the
+    # first step is Swagman (extract web content) and the second is Ollama
+    # (engage the local AI model); otherwise the plan is a single Ollama step.
+    #
+    # A companion action_detail.txt is created alongside the plan, seeded with
+    # the task prompt, so every action owner can append the outcome of its step
+    # for later steps (especially the local-AI step) to read.
+    # ------------------------------------------------------------------
+    logger.log_info(SCRIPT_NAME, f"Task ::: {task.task_dir}")
+
+    steps = _build_action_plan_steps(task.config)
+    plan = action_plan.create_plan(session_dir, steps, task_identifier=session_dir)
+    if plan is None:
+        return "Error while creating action plan"
+
+    prompt = build_prompt(task.name, prompt_content)
+    action_plan.create_detail(session_dir, prompt)
+
+    logger.log_info(
+        SCRIPT_NAME,
+        f"Task '{config_name}' action plan created with {len(steps)} step(s) "
+        f"(session {session_counter}).",
+    )
+
+    # Kick off the first actionable step by publishing it to its owner's queue.
+    first_step = action_plan.next_actionable_step(session_dir)
+    if first_step is None:
+        response = "Action plan has no actionable step to start"
+        logger.log_error(SCRIPT_NAME, f"Task '{config_name}': {response}.")
+    elif _start_step(session_dir, first_step, task.config, task.logs_dir):
+        response = (
+            f"Action plan started at step {first_step['step_id']} "
+            f"({first_step['action_owner']})"
         )
-        response = "Request queued for web extract successfully"
         logger.log_info(
             SCRIPT_NAME,
-            f"Task '{config_name}' published a web-extract job (session {session_counter}).",
+            f"Task '{config_name}' {response} (session {session_counter}).",
         )
-    except PublishError as e:
-        response = "Error while queuing message"
-        logger.log_error(SCRIPT_NAME, f"Task '{config_name}' failed to publish web-extract job: {e}")
-        logger.log_task_error(task.logs_dir, SCRIPT_NAME, f"Failed to publish web-extract job: {e}")
+    else:
+        response = "Error while starting the first action-plan step"
+        logger.log_error(SCRIPT_NAME, f"Task '{config_name}': {response}.")
 
     # Save execution timestamp regardless of success (to avoid retry storms)
     if "tasks" not in state:

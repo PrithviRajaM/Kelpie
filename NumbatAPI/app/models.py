@@ -115,6 +115,19 @@ class RunTaskResponse(BaseModel):
     name: str
 
 
+class StopTaskRequest(BaseModel):
+    """Request to stop a task and clear its in-progress work."""
+
+    email: EmailStr
+
+
+class StopTaskResponse(BaseModel):
+    """Acknowledgement that a task's in-progress work was cleared."""
+
+    message: str
+    name: str
+
+
 class LogRun(BaseModel):
     """A single task run within a log file.
 
