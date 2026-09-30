@@ -79,7 +79,12 @@ if _LOGGER_DIR not in sys.path:
 import kelpie_logger as logger
 from swagman import extract_web_page
 from Tasks import action_plan
-from Messaging.queue_publisher import publish_fallback, PublishError
+from Messaging.queue_publisher import (
+    _settings_for,
+    WEB_EXTRACT_CONFIG_KEY,
+    publish_fallback,
+    PublishError,
+)
 
 try:
     import pika
@@ -138,6 +143,29 @@ class ConsumerSettings:
         known = set(cls.__dataclass_fields__)
         filtered = {k: v for k, v in data.items() if k in known}
         return cls(**filtered)
+
+    @classmethod
+    def from_config(cls) -> "ConsumerSettings":
+        """Build settings from the ``web_extract`` entry in ``queue.config``.
+
+        Mirrors the other Kelpie consumers so the connection and queue name live
+        in ``queue.config`` alone. This is what the entry points use when called
+        without explicit settings (e.g. by ``consumer_dispatcher``), so the
+        consumer honours the config instead of silently falling back to
+        hardcoded defaults.
+        """
+        qs = _settings_for(WEB_EXTRACT_CONFIG_KEY)
+        return cls(
+            host=qs.host,
+            port=qs.port,
+            queue=qs.queue,
+            username=qs.username,
+            password=qs.password,
+            virtual_host=qs.virtual_host,
+            durable=qs.durable,
+            connection_attempts=qs.connection_attempts,
+            retry_delay=qs.retry_delay,
+        )
 
 
 def _decode_payload(body: bytes) -> dict:
@@ -365,7 +393,7 @@ def consume(settings: Optional[ConsumerSettings] = None) -> None:
             f"The 'pika' package is required to consume messages: {_IMPORT_ERROR}"
         )
 
-    settings = settings or ConsumerSettings()
+    settings = settings or ConsumerSettings.from_config()
 
     credentials = pika.PlainCredentials(settings.username, settings.password)
     parameters = pika.ConnectionParameters(
@@ -444,7 +472,7 @@ def consume_forever(
         settings: Connection and routing settings. Defaults are used if omitted.
         reconnect_delay: Seconds to wait before reconnecting after a failure.
     """
-    settings = settings or ConsumerSettings()
+    settings = settings or ConsumerSettings.from_config()
 
     while True:
         try:
@@ -493,7 +521,7 @@ def drain(settings: Optional[ConsumerSettings] = None) -> int:
             f"The 'pika' package is required to consume messages: {_IMPORT_ERROR}"
         )
 
-    settings = settings or ConsumerSettings()
+    settings = settings or ConsumerSettings.from_config()
 
     credentials = pika.PlainCredentials(settings.username, settings.password)
     parameters = pika.ConnectionParameters(
@@ -584,14 +612,27 @@ def main() -> int:
         Process exit code: 0 on a clean stop/drain, 1 on a connection error.
     """
     args = _build_arg_parser().parse_args()
+    # Start from the config-driven defaults (queue.config, web_extract entry),
+    # then apply only the CLI values the user actually changed from the argparse
+    # defaults. This keeps an unqualified run faithful to queue.config while
+    # still honouring explicit overrides.
+    defaults = ConsumerSettings()
+    base = ConsumerSettings.from_config()
     settings = ConsumerSettings(
-        host=args.host,
-        port=args.port,
-        queue=args.queue,
-        username=args.username,
-        password=args.password,
-        virtual_host=args.virtual_host,
+        host=args.host if args.host != defaults.host else base.host,
+        port=args.port if args.port != defaults.port else base.port,
+        queue=args.queue if args.queue != defaults.queue else base.queue,
+        username=args.username if args.username != defaults.username else base.username,
+        password=args.password if args.password != defaults.password else base.password,
+        virtual_host=(
+            args.virtual_host
+            if args.virtual_host != defaults.virtual_host
+            else base.virtual_host
+        ),
+        durable=base.durable,
         prefetch=args.prefetch,
+        connection_attempts=base.connection_attempts,
+        retry_delay=base.retry_delay,
     )
 
     try:

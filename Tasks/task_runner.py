@@ -68,6 +68,10 @@ TASK_CONFIG_FILENAME = "TaskConfig.json"
 TASK_PROMPT_FILENAME = "TaskPrompt.txt"
 TASK_LOGS_DIRNAME = "Logs"
 
+# Suffix the UI/API appends to a task folder on soft-delete (see services.py
+# DELETED_SUFFIX). Folders carrying this suffix are ignored by task discovery.
+DELETED_TASK_SUFFIX = "_DELETED"
+
 # Per-profile config file (holds that profile's incrementing session counter).
 # Lives directly inside the profile folder: "<DATA_ROOT>/<email>/Task_Config.json".
 PROFILE_CONFIG_FILENAME = "Task_Config.json"
@@ -139,6 +143,15 @@ def discover_tasks() -> list:
         for task_name in sorted(os.listdir(tasks_dir)):
             task_dir = os.path.join(tasks_dir, task_name)
             if not os.path.isdir(task_dir):
+                continue
+
+            # Tasks deleted from the UI are marked by a "_DELETED" suffix on
+            # their folder name. Such tasks must never be run.
+            if task_name.endswith(DELETED_TASK_SUFFIX):
+                logger.log_info(
+                    SCRIPT_NAME,
+                    f"Skipping deleted task folder '{task_name}'.",
+                )
                 continue
 
             config_path = os.path.join(task_dir, TASK_CONFIG_FILENAME)

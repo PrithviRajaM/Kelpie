@@ -82,6 +82,13 @@ SCRIPT_NAME = "consumer_dispatcher.py"
 #: Seconds to wait between drain passes.
 RUN_DELAY_SECONDS = 10.0
 
+#: Max age of a "running" state file before it is treated as stale. A live loop
+#: drains until the queues are empty and then stops, so it should never stay
+#: "running" for hours. If the recorded start time is older than this, the loop
+#: is assumed to have crashed without writing "stopped" and the state is not
+#: trusted (so start_if_idle can spawn a fresh loop). Set to 0 to disable.
+MAX_RUNNING_AGE_SECONDS = 6 * 60 * 60  # 6 hours
+
 #: Path to the messaging config that lists the consumers to drive.
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "queue.config")
 
@@ -225,8 +232,12 @@ def _pid_alive(pid: int) -> bool:
                 check=False,
             )
         except Exception:
-            # If we cannot check, assume alive to avoid spawning a duplicate.
-            return True
+            # If we cannot check, fail *closed*: treat the process as not
+            # running. Failing open ("assume alive") permanently wedges the
+            # dispatcher, because start_if_idle() would then never spawn a new
+            # loop after a crash. A rare false "not alive" only risks a second
+            # loop, which is harmless (each drains idempotently and exits).
+            return False
         return str(pid) in (out.stdout or "")
     # POSIX: signal 0 probes existence without affecting the process.
     try:
@@ -252,11 +263,36 @@ def is_running() -> bool:
     try:
         pid = int(pid)
     except (ValueError, TypeError):
-        
+        return False
+    # A "running" record older than MAX_RUNNING_AGE_SECONDS is treated as stale
+    # (a crashed loop that never wrote "stopped"), so it never permanently
+    # blocks future runs even if the PID happens to be reused/alive.
+    if MAX_RUNNING_AGE_SECONDS and _running_age_exceeded(state):
+        _log_info(
+            "Ignoring stale 'running' dispatcher state "
+            f"(started_at={state.get('started_at')!r}); treating as not running."
+        )
         return False
     if pid == os.getpid():
         return True
     return _pid_alive(pid)
+
+
+def _running_age_exceeded(state: dict) -> bool:
+    """Return True if the state's ``started_at`` is older than the max age.
+
+    A malformed or missing timestamp is treated as *not* exceeded, so the PID
+    liveness check remains the deciding factor in that case.
+    """
+    started_raw = state.get("started_at")
+    if not isinstance(started_raw, str):
+        return False
+    try:
+        started = datetime.fromisoformat(started_raw)
+    except ValueError:
+        return False
+    age = (datetime.now() - started).total_seconds()
+    return age > MAX_RUNNING_AGE_SECONDS
 
 
 def _mark_running() -> None:
