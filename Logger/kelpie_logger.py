@@ -256,17 +256,35 @@ def _task_log_file_path(logs_dir: str) -> str:
 def _write_task(logs_dir: str, line: str):
     """Append a formatted line to today's log file inside a task's Logs folder.
 
-    The ``Logs`` folder is created if it does not already exist. Failures are
-    swallowed so per-task logging can never abort a running task; the global
-    log remains the source of truth for hard errors.
+    The ``Logs`` folder is created if it does not already exist. If the per-task
+    write fails (e.g. ``logs_dir`` is invalid, unwritable, or contains illegal
+    path characters), the failure is not swallowed silently: the original line
+    plus a diagnostic note are redirected to the global log so the problem is
+    visible and the line is not lost. Per-task logging still never aborts a
+    running task - a failure of the global fallback itself is the only thing
+    swallowed, as a last resort.
     """
     try:
         os.makedirs(logs_dir, exist_ok=True)
         filepath = _task_log_file_path(logs_dir)
         with open(filepath, "a", encoding="utf-8") as f:
             f.write(line + "\n")
-    except OSError:
-        pass
+    except OSError as exc:
+        # The task log could not be written; fall back to the global log so the
+        # line survives and the misconfiguration surfaces instead of vanishing.
+        try:
+            _ensure_log_dir()
+            note = _format_line(
+                __name__,
+                f"[ERROR] Failed to write task log to '{logs_dir}': "
+                f"{type(exc).__name__}: {exc}. Original line redirected here.",
+            )
+            _write(note)
+            _write(line)
+        except OSError:
+            # Even the global log is unavailable; give up rather than crash the
+            # running task.
+            pass
 
 
 def log_task(logs_dir: str, level: str, source: str, message: str):

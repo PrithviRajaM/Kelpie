@@ -55,6 +55,21 @@ import kelpie_logger as logger
 
 SCRIPT_NAME = "web_extract.py"
 
+
+def _log(logs_dir, level: str, message: str) -> None:
+    """Log ``message`` against a task when ``logs_dir`` is set, else globally.
+
+    When a caller supplies the task's ``Logs`` folder, the line is written to
+    that task's own log via the ``log_task_*`` API (matching how
+    ``Tasks/task_runner.py`` records per-task lines). When ``logs_dir`` is None
+    (e.g. a standalone CLI capture with no owning task), it falls back to the
+    ordinary global log helpers.
+    """
+    if logs_dir:
+        getattr(logger, f"log_task_{level}")(logs_dir, SCRIPT_NAME, message)
+    else:
+        getattr(logger, f"log_{level}")(SCRIPT_NAME, message)
+
 # Lyrebird native-messaging bridge endpoint. The bridge host listens only on
 # the loopback interface. Change the port here if you changed PORT in
 # lyrebird_bridge_host.py.
@@ -154,7 +169,7 @@ def _send_to_bridge(web_url: str, filename: str) -> dict:
         }
 
 
-def extract_web_content(web_url: str) -> str | None:
+def extract_web_content(web_url: str, logs_dir: str | None = None) -> str | None:
     """Ask the Lyrebird extension to download ``web_url`` as a single file.
 
     A download filename is generated from ``destination_folder_name``, the URL
@@ -174,13 +189,14 @@ def extract_web_content(web_url: str) -> str | None:
         exists.
     """
     if not web_url:
-        logger.log_error(SCRIPT_NAME, "No web_url provided for web extraction.")
+        _log(logs_dir, "error", "No web_url provided for web extraction.")
         return None
 
     filename = _build_download_filename(web_url)
 
-    logger.log_info(
-        SCRIPT_NAME,
+    _log(
+        logs_dir,
+        "info",
         f"Requesting Lyrebird capture of '{web_url}' as '{filename}' "
         f"via bridge {BRIDGE_HOST}:{BRIDGE_PORT}.",
     )
@@ -189,16 +205,18 @@ def extract_web_content(web_url: str) -> str | None:
 
     status = result.get("status")
     if status == "forwarded":
-        logger.log_info(
-            SCRIPT_NAME,
+        _log(
+            logs_dir,
+            "info",
             f"Lyrebird capture of '{web_url}' forwarded to the extension. "
             f"Download filename: '{filename}'.",
         )
         return filename
 
     error = result.get("error", "unknown error")
-    logger.log_error(
-        SCRIPT_NAME,
+    _log(
+        logs_dir,
+        "error",
         f"Lyrebird bridge rejected the request for '{web_url}': {error}",
     )
     return None
@@ -280,7 +298,7 @@ def _resolve_destination_dir(destination_folder: str) -> str:
     return target
 
 
-def run_web_extract_task(task: dict) -> str | None:
+def run_web_extract_task(task: dict, logs_dir: str | None = None) -> str | None:
     """Execute a ``web_extract`` task.
 
     Sends a capture request to the Lyrebird extension, then waits for the
@@ -315,31 +333,34 @@ def run_web_extract_task(task: dict) -> str | None:
     # (task_identifier), so the default becomes "<task_name>/web_extract".
     if not destination_folder:
         destination_folder = os.path.join(task_name, WEB_EXTRACT_SUBDIR)
-        logger.log_info(
-            SCRIPT_NAME,
+        _log(
+            logs_dir,
+            "info",
             f"No destination_folder_name provided for task '{task_name}'. "
             f"Defaulting to '{destination_folder}'.",
         )
 
-    logger.log_info(SCRIPT_NAME, f"Running web_extract task '{task_name}'.")
+    _log(logs_dir, "info", f"Running web_extract task '{task_name}'.")
 
     if not web_url:
-        logger.log_error(SCRIPT_NAME, f"web_extract task '{task_name}' has no 'web_url'. Skipping.")
+        _log(logs_dir, "error", f"web_extract task '{task_name}' has no 'web_url'. Skipping.")
         return None
 
     # Step 1: send the capture request. The returned filename is what the
     # extension will save into the Downloads folder. A None result means the
     # request was not successfully sent to the extension.
-    filename = extract_web_content(web_url)
+    filename = extract_web_content(web_url, logs_dir=logs_dir)
     if not filename:
-        logger.log_error(
-            SCRIPT_NAME,
+        _log(
+            logs_dir,
+            "error",
             f"web_extract task '{task_name}': request was not sent to the Lyrebird extension.",
         )
         return None
 
-    logger.log_info(
-        SCRIPT_NAME,
+    _log(
+        logs_dir,
+        "info",
         f"web_extract task '{task_name}': request successfully sent to the extension "
         f"for filename '{filename}'. Waiting up to {DOWNLOAD_WAIT_TIMEOUT_SECONDS}s "
         f"for the download to complete.",
@@ -350,16 +371,18 @@ def run_web_extract_task(task: dict) -> str | None:
     downloaded_path, elapsed = _wait_for_download(filename, downloads_dir)
 
     if not downloaded_path:
-        logger.log_error(
-            SCRIPT_NAME,
+        _log(
+            logs_dir,
+            "error",
             f"web_extract task '{task_name}': timed out after "
             f"{DOWNLOAD_WAIT_TIMEOUT_SECONDS}s waiting for '{filename}' in "
             f"'{downloads_dir}'.",
         )
         return None
 
-    logger.log_info(
-        SCRIPT_NAME,
+    _log(
+        logs_dir,
+        "info",
         f"web_extract task '{task_name}': file '{os.path.basename(downloaded_path)}' "
         f"downloaded in {elapsed:.1f}s.",
     )
@@ -370,15 +393,17 @@ def run_web_extract_task(task: dict) -> str | None:
         final_path = os.path.join(destination_dir, os.path.basename(downloaded_path))
         shutil.move(downloaded_path, final_path)
     except (OSError, shutil.Error) as e:
-        logger.log_error(
-            SCRIPT_NAME,
+        _log(
+            logs_dir,
+            "error",
             f"web_extract task '{task_name}': failed to move '{downloaded_path}' "
             f"to destination: {type(e).__name__}: {e}",
         )
         return None
 
-    logger.log_info(
-        SCRIPT_NAME,
+    _log(
+        logs_dir,
+        "info",
         f"web_extract task '{task_name}': moved capture to '{final_path}'. Done.",
     )
     return final_path

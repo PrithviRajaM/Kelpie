@@ -59,6 +59,7 @@ if os.path.join(PROJECT_ROOT, "Logger") not in sys.path:
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "Logger"))
 
 import kelpie_logger as logger
+import config as kelpie_config
 from Tasks import action_plan
 from Messaging.queue_publisher import (
     _settings_for,
@@ -80,6 +81,23 @@ SCRIPT_NAME = "fallback_consumer.py"
 
 # Fixed filename of a task's persisted config (mirrors task_runner.py).
 TASK_CONFIG_FILENAME = "TaskConfig.json"
+
+# Name of the per-task Logs folder (mirrors task_runner.TASK_LOGS_DIRNAME). A
+# task's log lives at "<task_dir>/Logs", and a session folder is
+# "<task_dir>/InProgress/<session_counter>", so the Logs dir is two levels up.
+TASK_LOGS_DIRNAME = "Logs"
+
+
+def _logs_dir_for(session_dir: str) -> str:
+    """Derive a task's ``Logs`` folder from its InProgress session-folder path.
+
+    ``session_dir`` is the decoded
+    ``<task_dir>/InProgress/<session_counter>`` path, so the task folder is two
+    levels up and its ``Logs`` folder sits beside ``InProgress``.
+    """
+    normalized = os.path.normpath(session_dir)
+    task_dir = os.path.dirname(os.path.dirname(normalized))
+    return os.path.join(task_dir, TASK_LOGS_DIRNAME)
 
 
 class ConsumeError(Exception):
@@ -178,6 +196,12 @@ def _extract_fields(msg: dict) -> tuple[str, int, str]:
     except (ValueError, TypeError) as exc:
         raise ValueError(f"step_id must be an integer, got {step_raw!r}") from exc
 
+    # Resolve the compact "{profile}|{task}|{counter}" token to the absolute
+    # InProgress session folder so the plan bookkeeping and TaskConfig.json
+    # lookup (which walk the on-disk path) work unchanged. Legacy absolute
+    # paths pass through untouched.
+    task_identifier = kelpie_config.decode_task_identifier(task_identifier)
+
     return task_identifier, step_id, status
 
 
@@ -231,12 +255,15 @@ def _start_step(session_dir: str, step: dict) -> bool:
         if owner == action_plan.OWNER_SWAGMAN:
             config = _load_task_config(session_dir)
             urls = _config_web_urls(config)
+            task_identifier = kelpie_config.task_identifier_from_session_dir(
+                session_dir
+            )
             for url in urls:
                 publish_web_extract(
                     {
-                        "task_identifier": session_dir,
+                        "task_identifier": task_identifier,
                         "web_url": url,
-                        "destination_folder_name": session_dir,
+                        "destination_folder_name": task_identifier,
                         "step_id": step_id,
                     }
                 )
@@ -248,7 +275,14 @@ def _start_step(session_dir: str, step: dict) -> bool:
             return True
 
         if owner == action_plan.OWNER_OLLAMA:
-            publish_local_ai({"task_identifier": session_dir, "step_id": step_id})
+            publish_local_ai(
+                {
+                    "task_identifier": kelpie_config.task_identifier_from_session_dir(
+                        session_dir
+                    ),
+                    "step_id": step_id,
+                }
+            )
             logger.log_info(
                 SCRIPT_NAME,
                 f"Advanced to step {step_id} (Ollama): published local-AI job.",
@@ -322,6 +356,22 @@ def _handle_message(channel, method, properties, body) -> None:
         logger.log_error(
             SCRIPT_NAME,
             f"Discarding malformed fallback message (delivery_tag={delivery_tag}): {exc}",
+        )
+        channel.basic_ack(delivery_tag=delivery_tag)
+        return
+
+    # The task may have been moved/removed from InProgress since this message
+    # was published (e.g. cancelled or already completed). If its session folder
+    # is gone, there is nothing to advance: record it against the task, ack the
+    # message so it leaves the queue, and stop here.
+    if not os.path.isdir(task_identifier):
+        logs_dir = _logs_dir_for(task_identifier)
+        logger.log_task_warning(
+            logs_dir,
+            SCRIPT_NAME,
+            f"Task session folder no longer exists: '{task_identifier}'. "
+            f"Discarding fallback status '{status}' for step {step_id} "
+            f"without advancing the plan.",
         )
         channel.basic_ack(delivery_tag=delivery_tag)
         return

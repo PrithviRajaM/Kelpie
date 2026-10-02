@@ -533,22 +533,25 @@ def _start_step(session_dir: str, step: dict, config: dict, logs_dir: str) -> bo
     # task log; the publisher takes an explicit callback, so point it at the
     # active task log (falling back to logs_dir) to keep publish events on the
     # task's own log too.
-    log = lambda m: logger.log_info(SCRIPT_NAME, m)
+    log = lambda m: logger.log_task_info(logs_dir, SCRIPT_NAME, m)
 
     try:
         if owner == action_plan.OWNER_SWAGMAN:
             urls = _web_urls(config)
             for url in urls:
+                task_identifier = kelpie_config.task_identifier_from_session_dir(
+                    session_dir
+                )
                 publish_web_extract(
                     {
-                        "task_identifier": session_dir,
+                        "task_identifier": task_identifier,
                         "web_url": url,
-                        "destination_folder_name": session_dir,
+                        "destination_folder_name": task_identifier,
                         "step_id": step_id,
                     },
                     log=log,
                 )
-            logger.log_info(
+            logger.log_task_info( logs_dir,
                 SCRIPT_NAME,
                 f"Published {len(urls)} web-extract job(s) for step {step_id}.",
             )
@@ -556,19 +559,24 @@ def _start_step(session_dir: str, step: dict, config: dict, logs_dir: str) -> bo
 
         if owner == action_plan.OWNER_OLLAMA:
             publish_local_ai(
-                {"task_identifier": session_dir, "step_id": step_id},
+                {
+                    "task_identifier": kelpie_config.task_identifier_from_session_dir(
+                        session_dir
+                    ),
+                    "step_id": step_id,
+                },
                 log=log,
             )
-            logger.log_info(SCRIPT_NAME, f"Published local-AI job for step {step_id}.")
+            logger.log_task_info(logs_dir, SCRIPT_NAME, f"Published local-AI job for step {step_id}.")
             return True
 
         msg = f"Unknown action owner '{owner}' for step {step_id}; cannot start."
-        logger.log_error(SCRIPT_NAME, msg)
+        logger.log_task_error(logs_dir, SCRIPT_NAME, msg)
         action_plan.update_step_status(session_dir, step_id, action_plan.STATUS_FAILED)
         return False
     except PublishError as e:
         msg = f"Failed to publish step {step_id} ({owner}) job: {e}"
-        logger.log_error(SCRIPT_NAME, msg)
+        logger.log_task_error(logs_dir, SCRIPT_NAME, msg)
         action_plan.update_step_status(session_dir, step_id, action_plan.STATUS_FAILED)
         return False
 
@@ -605,7 +613,6 @@ def execute_task(task, config_name: str, state: dict) -> str:
                 f"Task '{config_name}' ({task.email}) execution terminated: "
                 f"the task is already in progress (an active session exists under {inprogress_dir})."
             )
-            logger.log_warning(SCRIPT_NAME, msg)
             logger.log_task_warning(task.logs_dir, SCRIPT_NAME, msg)
             return "The task execution has been terminated because an earlier instance of the same task is still in progress."
 

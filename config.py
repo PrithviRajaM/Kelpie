@@ -100,3 +100,121 @@ def get_save_script_name() -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+# ---------------------------------------------------------------------------
+# Task identifier encoding / decoding
+# ---------------------------------------------------------------------------
+#
+# Messages published between Kelpie's components (web-extract, local-AI and
+# fallback queues) carry a ``task_identifier`` that names the run. Historically
+# this was the *entire absolute path* of the run's InProgress session folder::
+#
+#     <data_root>/<profile_name>/Tasks/<task_name>/InProgress/<session_counter>
+#
+# That leaks the on-disk layout onto the wire and is brittle. Instead the wire
+# now carries a compact, path-free token::
+#
+#     "{profile_name}|{task_name}|{session_counter}"
+#
+# Consumers decode it back to the absolute session folder path (the mapping is
+# fully deterministic given the data root), so all existing filesystem logic
+# keeps working unchanged. Legacy absolute paths (no ``|``) are still accepted
+# for backward compatibility.
+
+#: Delimiter between the three parts of a compact task identifier.
+TASK_IDENTIFIER_SEPARATOR = "|"
+
+#: Path segment (under the profile folder) that holds a profile's tasks.
+PROFILE_TASKS_SUBDIR = "Tasks"
+
+#: Path segment (under a task folder) that holds in-progress session folders.
+INPROGRESS_DIRNAME = "InProgress"
+
+
+def encode_task_identifier(profile_name: str, task_name: str, session_counter) -> str:
+    """Build the compact ``"{profile_name}|{task_name}|{session_counter}"`` token.
+
+    Args:
+        profile_name: The owning profile (the folder directly under the data
+            root, e.g. an email).
+        task_name: The task's folder name.
+        session_counter: The InProgress session counter for this run.
+
+    Returns:
+        The compact task identifier carried on the wire.
+    """
+    return (
+        f"{profile_name}{TASK_IDENTIFIER_SEPARATOR}"
+        f"{task_name}{TASK_IDENTIFIER_SEPARATOR}{session_counter}"
+    )
+
+
+def is_compact_task_identifier(value: str) -> bool:
+    """Return True if ``value`` looks like a compact token (contains the sep)."""
+    return isinstance(value, str) and TASK_IDENTIFIER_SEPARATOR in value
+
+
+def decode_task_identifier(value: str) -> str:
+    """Resolve a task identifier to the absolute InProgress session folder path.
+
+    Accepts either a compact ``"{profile_name}|{task_name}|{session_counter}"``
+    token (resolved against the data root into
+    ``<data_root>/<profile_name>/Tasks/<task_name>/InProgress/<session_counter>``)
+    or a legacy absolute session-folder path (returned unchanged), so producers
+    and consumers can be upgraded independently.
+
+    Args:
+        value: A compact token or a legacy absolute path.
+
+    Returns:
+        The absolute path of the InProgress session folder.
+
+    Raises:
+        ValueError: If a compact token does not split into exactly three parts.
+    """
+    if not is_compact_task_identifier(value):
+        # Legacy absolute path (or already-resolved path): use as-is.
+        return value
+
+    # maxsplit=2 so a stray separator inside a task name never bleeds into the
+    # session_counter; the counter is always the final segment.
+    parts = value.split(TASK_IDENTIFIER_SEPARATOR, 2)
+    if len(parts) != 3 or not all(part.strip() for part in parts):
+        raise ValueError(
+            f"malformed task identifier {value!r}: expected "
+            f"'profile_name{TASK_IDENTIFIER_SEPARATOR}task_name"
+            f"{TASK_IDENTIFIER_SEPARATOR}session_counter'"
+        )
+
+    profile_name, task_name, session_counter = (part.strip() for part in parts)
+    return os.path.join(
+        get_data_root(),
+        profile_name,
+        PROFILE_TASKS_SUBDIR,
+        task_name,
+        INPROGRESS_DIRNAME,
+        str(session_counter),
+    )
+
+
+def task_identifier_from_session_dir(session_dir: str) -> str:
+    """Derive the compact token from an absolute InProgress session-folder path.
+
+    Inverse of :func:`decode_task_identifier` for the common case where a
+    consumer holds the resolved ``session_dir`` and needs to re-publish. The
+    path is expected to end with
+    ``.../<profile_name>/Tasks/<task_name>/InProgress/<session_counter>``.
+
+    If the path does not have that shape it is returned unchanged so callers
+    degrade gracefully to the legacy behaviour.
+    """
+    normalized = os.path.normpath(session_dir)
+    parts = normalized.split(os.sep)
+    # Need at least: profile, "Tasks", task, "InProgress", counter.
+    if len(parts) >= 5 and parts[-2] == INPROGRESS_DIRNAME and parts[-4] == PROFILE_TASKS_SUBDIR:
+        profile_name = parts[-5]
+        task_name = parts[-3]
+        session_counter = parts[-1]
+        return encode_task_identifier(profile_name, task_name, session_counter)
+    return session_dir

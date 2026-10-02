@@ -57,6 +57,7 @@ if os.path.join(PROJECT_ROOT, "Ollama") not in sys.path:
     sys.path.insert(0, os.path.join(PROJECT_ROOT, "Ollama"))
 
 import kelpie_logger as logger
+import config as kelpie_config
 from Tasks import action_plan
 from Tasks.task_runner import run_ollama, SESSION_CONTEXT_FILENAME
 from Messaging.queue_publisher import (
@@ -75,6 +76,23 @@ else:
     _IMPORT_ERROR = None
 
 SCRIPT_NAME = "local_ai_consumer.py"
+
+# Name of the per-task Logs folder (mirrors task_runner.TASK_LOGS_DIRNAME). A
+# task's log lives at "<task_dir>/Logs", and a session folder is
+# "<task_dir>/InProgress/<session_counter>", so the Logs dir is two levels up.
+TASK_LOGS_DIRNAME = "Logs"
+
+
+def _logs_dir_for(session_dir: str) -> str:
+    """Derive a task's ``Logs`` folder from its InProgress session-folder path.
+
+    ``session_dir`` is the decoded
+    ``<task_dir>/InProgress/<session_counter>`` path, so the task folder is two
+    levels up and its ``Logs`` folder sits beside ``InProgress``.
+    """
+    normalized = os.path.normpath(session_dir)
+    task_dir = os.path.dirname(os.path.dirname(normalized))
+    return os.path.join(task_dir, TASK_LOGS_DIRNAME)
 
 
 class ConsumeError(Exception):
@@ -160,6 +178,11 @@ def _extract_fields(msg: dict) -> tuple[str, int]:
         step_id = int(step_raw)
     except (ValueError, TypeError) as exc:
         raise ValueError(f"step_id must be an integer, got {step_raw!r}") from exc
+
+    # Resolve the compact "{profile}|{task}|{counter}" token to the absolute
+    # InProgress session folder so reading session_context.txt / action_detail
+    # works unchanged. Legacy absolute paths pass through untouched.
+    task_identifier = kelpie_config.decode_task_identifier(task_identifier)
 
     return task_identifier, step_id
 
@@ -252,6 +275,21 @@ def _handle_message(channel, method, properties, body) -> None:
         channel.basic_ack(delivery_tag=delivery_tag)
         return
 
+    # The task may have been moved/removed from InProgress since this message
+    # was published (e.g. cancelled or already completed). If its session folder
+    # is gone, there is nothing to process: record it against the task, ack the
+    # message so it leaves the queue, and stop here.
+    if not os.path.isdir(task_identifier):
+        logs_dir = _logs_dir_for(task_identifier)
+        logger.log_task_warning(
+            logs_dir,
+            SCRIPT_NAME,
+            f"Task session folder no longer exists: '{task_identifier}'. "
+            f"Discarding local-AI job for step {step_id} without processing.",
+        )
+        channel.basic_ack(delivery_tag=delivery_tag)
+        return
+
     logger.log_info(
         SCRIPT_NAME,
         f"Processing local-AI job for step {step_id} of '{task_identifier}'.",
@@ -272,7 +310,9 @@ def _handle_message(channel, method, properties, body) -> None:
     try:
         publish_fallback(
             {
-                "task_identifier": task_identifier,
+                "task_identifier": kelpie_config.task_identifier_from_session_dir(
+                    task_identifier
+                ),
                 "step_id": step_id,
                 "status": status,
             }

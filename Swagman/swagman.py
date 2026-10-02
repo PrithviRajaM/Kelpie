@@ -44,6 +44,35 @@ from web_extract import run_web_extract_task
 
 SCRIPT_NAME = "swagman.py"
 
+# Name of the per-task Logs folder (mirrors task_runner.TASK_LOGS_DIRNAME). A
+# session folder is "<task_dir>/InProgress/<session_counter>", so the task's
+# Logs folder sits two levels up, beside "InProgress".
+TASK_LOGS_DIRNAME = "Logs"
+
+
+def _logs_dir_for(task_identifier: str) -> str | None:
+    """Derive a task's ``Logs`` folder from an InProgress session-folder path.
+
+    Mirrors how ``Tasks/task_runner.py`` builds ``DiscoveredTask.logs_dir``
+    (``<task_dir>/Logs``). ``task_identifier`` is the decoded
+    ``<task_dir>/InProgress/<session_counter>`` path, so the task folder is two
+    levels up. Returns None when ``task_identifier`` is not an absolute session
+    path (e.g. a standalone label), so logging falls back to the global log.
+    """
+    if not task_identifier or not os.path.isabs(task_identifier):
+        return None
+    normalized = os.path.normpath(task_identifier)
+    task_dir = os.path.dirname(os.path.dirname(normalized))
+    return os.path.join(task_dir, TASK_LOGS_DIRNAME)
+
+
+def _log(logs_dir, level: str, message: str) -> None:
+    """Log against a task when ``logs_dir`` is set, else to the global log."""
+    if logs_dir:
+        getattr(logger, f"log_task_{level}")(logs_dir, SCRIPT_NAME, message)
+    else:
+        getattr(logger, f"log_{level}")(SCRIPT_NAME, message)
+
 
 def _validate_argument(name: str, value) -> str:
     """Validate that a mandatory string argument is present and non-empty.
@@ -96,8 +125,14 @@ def extract_web_page(task_identifier: str, web_url: str, destination_folder_name
     if isinstance(destination_folder_name, str):
         destination_folder_name = destination_folder_name.strip() or None
 
-    logger.log_info(
-        SCRIPT_NAME,
+    # When task_identifier is the decoded absolute InProgress session folder,
+    # derive the owning task's Logs folder so this run's log lines (here and in
+    # run_web_extract_task) are recorded against the task, matching task_runner.
+    logs_dir = _logs_dir_for(task_identifier)
+
+    _log(
+        logs_dir,
+        "info",
         f"extract_web_page called (task_identifier='{task_identifier}', "
         f"web_url='{web_url}', destination_folder_name='{destination_folder_name}').",
     )
@@ -108,7 +143,7 @@ def extract_web_page(task_identifier: str, web_url: str, destination_folder_name
         "destination_folder_name": destination_folder_name,
     }
 
-    return run_web_extract_task(task)
+    return run_web_extract_task(task, logs_dir=logs_dir)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

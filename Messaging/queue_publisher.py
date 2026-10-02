@@ -282,7 +282,7 @@ def publish_message(
                 f"Triggering consumer dispatcher after publish to "
                 f"'{settings.queue}'."
             )
-        _trigger_consumer_dispatch(log=log)
+        #_trigger_consumer_dispatch(log=log)
     except PublishError:
         raise
     except Exception as exc:  # pika raises a variety of connection errors

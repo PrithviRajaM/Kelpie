@@ -77,6 +77,7 @@ if _LOGGER_DIR not in sys.path:
     sys.path.insert(0, _LOGGER_DIR)
 
 import kelpie_logger as logger
+import config as kelpie_config
 from swagman import extract_web_page
 from Tasks import action_plan
 from Messaging.queue_publisher import (
@@ -95,6 +96,24 @@ else:
     _IMPORT_ERROR = None
 
 SCRIPT_NAME = "queue_consumer.py"
+
+# Name of the per-task Logs folder (mirrors task_runner.TASK_LOGS_DIRNAME). A
+# task's log lives at "<task_dir>/Logs", and a session folder is
+# "<task_dir>/InProgress/<session_counter>", so the Logs dir is two levels up.
+TASK_LOGS_DIRNAME = "Logs"
+
+
+def _logs_dir_for(session_dir: str) -> str:
+    """Derive a task's ``Logs`` folder from its InProgress session-folder path.
+
+    Mirrors how ``Tasks/task_runner.py`` builds ``DiscoveredTask.logs_dir``
+    (``<task_dir>/Logs``). ``session_dir`` is the decoded
+    ``<task_dir>/InProgress/<session_counter>`` path, so the task folder is two
+    levels up and its Logs folder sits beside ``InProgress``.
+    """
+    normalized = os.path.normpath(session_dir)
+    task_dir = os.path.dirname(os.path.dirname(normalized))
+    return os.path.join(task_dir, TASK_LOGS_DIRNAME)
 
 
 class ConsumeError(Exception):
@@ -238,6 +257,18 @@ def _extract_job_fields(job: dict) -> tuple[str, str, str]:
     if missing:
         raise ValueError(f"missing required field(s): {', '.join(missing)}")
 
+    # The wire carries a compact "{profile}|{task}|{counter}" token; resolve it
+    # back to the absolute InProgress session folder so downstream filesystem
+    # logic (moving captures, writing action_detail.txt, deriving the task's Logs
+    # folder) works unchanged. Legacy absolute paths pass through untouched.
+    # destination_folder_name mirrors the identifier when published as part of an
+    # action plan, so decode it too; a genuine standalone destination name (no
+    # separator) is left as-is.
+    task_identifier = kelpie_config.decode_task_identifier(task_identifier)
+    destination_folder_name = kelpie_config.decode_task_identifier(
+        destination_folder_name
+    )
+
     return task_identifier, web_url, destination_folder_name
 
 
@@ -284,20 +315,25 @@ def _report_step_progress(
         return
 
     status = action_plan.STATUS_COMPLETED if result_path else action_plan.STATUS_FAILED
+    logs_dir = _logs_dir_for(session_dir)
     try:
         publish_fallback(
             {
-                "task_identifier": session_dir,
+                "task_identifier": kelpie_config.task_identifier_from_session_dir(
+                    session_dir
+                ),
                 "step_id": step_id,
                 "status": status,
             }
         )
-        logger.log_info(
+        logger.log_task_info(
+            logs_dir,
             SCRIPT_NAME,
             f"Swagman step {step_id} for '{session_dir}' reported '{status}' to fallback.",
         )
     except PublishError as exc:
-        logger.log_error(
+        logger.log_task_error(
+            logs_dir,
             SCRIPT_NAME,
             f"Failed to post fallback status for '{session_dir}' step {step_id}: {exc}.",
         )
@@ -324,9 +360,45 @@ def _handle_message(channel, method, properties, body) -> None:
         channel.basic_ack(delivery_tag=delivery_tag)
         return
 
-    logger.log_info(
+    session_counter = task_identifier.split("\\")[-1]
+    logger.set_session_counter(session_counter)
+
+    
+    logger.log_info(SCRIPT_NAME, f"=============================== job: '{job}' ")
+    logger.log_info(SCRIPT_NAME, f"=============================== task_identifier: '{task_identifier}' ")
+
+    # From here on, this delivery belongs to a specific task run. task_identifier
+    # is the decoded absolute InProgress session folder, so derive that task's
+    # Logs folder (the same "<task_dir>/Logs" convention task_runner.py uses) and
+    # record every line below against the task via the log_task_* API - including
+    # the outcome logged inside _report_step_progress.
+    logs_dir = _logs_dir_for(task_identifier)
+
+    # The task may have been moved/removed from InProgress since this message
+    # was published (e.g. cancelled or already completed). If its session folder
+    # is gone, there is nothing to process: record it against the task, ack the
+    # message so it leaves the queue, and stop here.
+    if not os.path.isdir(task_identifier):
+        logger.log_task_warning(
+            logs_dir,
+            SCRIPT_NAME,
+            f"Task session folder no longer exists: '{task_identifier}'. "
+            f"Discarding web-extract job without processing.",
+        )
+        channel.basic_ack(delivery_tag=delivery_tag)
+        return
+
+    logger.log_info(SCRIPT_NAME, f"=============================== logger.session_counter: '{logger._session_counter}' ")
+    logger.log_info(SCRIPT_NAME, f"=============================== logs_dir: '{logs_dir}' ")
+    try:
+        logger.log_task_info(logs_dir, SCRIPT_NAME, f"=============================== logs_dir: '{logs_dir}' ")
+    except OSError as exc:
+        logger.log_info(SCRIPT_NAME, f"=============================== Exception Error: '{exc}' ")    
+    
+    logger.log_task_info(
+        logs_dir,
         SCRIPT_NAME,
-        f"Processing web-extract job '{task_identifier}' "
+        f"======Processing web-extract job '{task_identifier}' "
         f"(url='{web_url}', destination='{destination_folder_name}').",
     )
 
@@ -337,7 +409,8 @@ def _handle_message(channel, method, properties, body) -> None:
             destination_folder_name=destination_folder_name,
         )
     except Exception as exc:  # noqa: BLE001 - keep the consumer alive
-        logger.log_error(
+        logger.log_task_error(
+            logs_dir,
             SCRIPT_NAME,
             f"Job '{task_identifier}' raised an error: {exc}. "
             f"Nacking (no requeue).",
@@ -346,13 +419,15 @@ def _handle_message(channel, method, properties, body) -> None:
         return
 
     if result_path:
-        logger.log_info(
+        logger.log_task_info(
+            logs_dir,
             SCRIPT_NAME,
             f"Job '{task_identifier}' completed: {result_path}",
         )
     else:
         # extract_web_page returned None: the capture failed but was handled.
-        logger.log_warning(
+        logger.log_task_warning(
+            logs_dir,
             SCRIPT_NAME,
             f"Job '{task_identifier}' did not produce a file (see log above).",
         )
@@ -365,7 +440,8 @@ def _handle_message(channel, method, properties, body) -> None:
         try:
             _report_step_progress(task_identifier, step_id, web_url, result_path)
         except Exception as exc:  # noqa: BLE001 - never fail the ack on reporting
-            logger.log_error(
+            logger.log_task_error(
+                logs_dir,
                 SCRIPT_NAME,
                 f"Failed to report step progress for '{task_identifier}' "
                 f"step {step_id}: {exc}.",
